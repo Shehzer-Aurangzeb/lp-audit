@@ -1,0 +1,51 @@
+lp-audit: speed and code check for our landing pages
+
+It tests a page the way an ad visitor sees it, checks the code before launch,
+and writes a short report in simple English: what is wrong, how to fix it,
+how to check the fix. Rules decide what is broken; AI only writes the summary.
+
+USE IT IN THIS ORDER FOR EVERY LANDING PAGE
+
+  Before launch
+    1. lp-audit code <site folder> --url <page url>   check the code (30 s)
+    2. Run the Claude command printed at the end of the report (one pass)
+    3. lp-audit learn                                  turn Claude's new findings into rules
+    4. lp-audit prelaunch <page url>                   speed test + GTmetrix once (4 min)
+       Fix the problems, run 1 and 4 again until they pass.
+
+  While ads are running (a few days after start, then every week)
+    5. lp-audit live <page url>                        same tests + real visitors' data
+
+COMMANDS
+
+  lp-audit prelaunch <url>         before launch: lab test x3 (phone + desktop), real-visitor test
+                                   (waits, scrolls, finds what jumps), server checks, GTmetrix x1
+       --runs 1                    faster (1 run instead of 3)
+       --no-gtmetrix               skip GTmetrix (free plan has only 5 tests)
+       --local-lab                 use this laptop for the lab test (for staging Google cannot open)
+
+  lp-audit live <url>              ads running: same tests + Google and Cloudflare real-user data
+       --gtmetrix                  also run GTmetrix once
+
+  lp-audit code [folder]           code audit of a site folder (default: the folder you are in)
+       --url <page url>            link speed problems to code lines, check what is uploaded
+       --no-semgrep                skip Semgrep (it needs internet)
+
+  lp-audit learn                   review Claude's findings, add good ones as rules
+  lp-audit rules                   list rules: how often each fired, false alarms
+  lp-audit rules false-alarm <id>  mark a wrong hit
+  lp-audit rules export            zip our rules to share with the team
+  lp-audit rules import <zip>      add the team's rules (put the zip in reports/ first)
+
+  lp-audit history <domain>        past audits of a site
+  lp-audit clean <domain>          delete a site's reports
+  lp-audit clean --older-than 90   delete reports older than 90 days
+  lp-audit open                    open the reports folder
+
+  lp-audit setup                   first time: create .env, check Docker and Ollama, build
+  lp-audit update                  get the latest version (git pull + rebuild)
+  lp-audit test                    self-check, prints "demo ok"
+  lp-audit help                    this text
+
+Reports: reports/<domain>/<date>_<mode>/report.md inside the lp-audit folder.
+Every command also has its own help, e.g.: lp-audit prelaunch --help

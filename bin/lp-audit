@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# lp-audit launcher (Mac/Linux). `lp-audit help` lists the commands.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
+export LP_AUDIT_DIR="$ROOT"
+compose() { docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" "$@"; }
+
+need_docker() {
+  docker info >/dev/null 2>&1 || { echo "Docker is not running. Start Docker Desktop and try again." >&2; exit 1; }
+}
+
+cmd="${1:-help}"
+case "$cmd" in
+  help|-h|--help)
+    cat "$ROOT/bin/help.txt" ;;
+  setup)
+    [ -f "$ROOT/.env" ] || { cp "$ROOT/.env.example" "$ROOT/.env"; echo "Created .env. Open it and fill in your keys: $ROOT/.env"; }
+    need_docker
+    command -v ollama >/dev/null && echo "Ollama: found" || echo "Ollama: not found. Install it from ollama.com, then: ollama pull qwen2.5:3b"
+    compose build && compose run --rm -T audit ;;
+  update)
+    git -C "$ROOT" pull --ff-only && need_docker && compose build && compose run --rm -T audit ;;
+  build)
+    need_docker; compose build ;;
+  test)
+    need_docker; compose run --rm -T audit ;;
+  open)
+    mkdir -p "$ROOT/reports"; (open "$ROOT/reports" 2>/dev/null || xdg-open "$ROOT/reports") ;;
+  code)
+    shift
+    dir="$PWD"
+    if [ $# -gt 0 ] && [ -d "$1" ]; then dir="$1"; shift; fi
+    need_docker
+    abs="$(cd "$dir" && pwd)"
+    CODE="$abs" compose run --rm -e CODE_NAME="$(basename "$abs")" audit code /code "$@" ;;
+  *)
+    need_docker; compose run --rm audit "$@" ;;
+esac

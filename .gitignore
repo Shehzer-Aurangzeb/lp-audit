@@ -1,0 +1,6 @@
+.env
+reports/
+samples/demo-site/.git/
+samples/demo-site/.gitignore
+__pycache__/
+.DS_Store

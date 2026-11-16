@@ -1,0 +1,17 @@
+services:
+  audit:
+    build: .
+    image: lp-audit
+    env_file: .env
+    shm_size: 1gb            # Chrome needs more than Docker's 64 MB default
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach Ollama on the laptop
+    environment:
+      LP_AUDIT_DIR: ${LP_AUDIT_DIR:-.}   # set by bin/lp-audit: reports show paths you can open on your laptop
+    volumes:
+      - ./reports:/data/reports
+      - ./rules.json:/app/rules.json:ro
+      - ./code_rules.json:/app/code_rules.json          # 'audit learn' adds rules here
+      - ./manual_checklist.json:/app/manual_checklist.json
+      - ./samples:/app/samples:ro
+      - ${CODE:-./samples/demo-site}:/code   # the site folder for 'audit code' (set CODE=...)

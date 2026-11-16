@@ -1,0 +1,7 @@
+[
+ {
+  "title": "Form shows a thank-you page that fires the ad conversion tag",
+  "why": "After submit the visitor sees a blank page, and ad conversion tracking never fires.",
+  "from": "example"
+ }
+]
