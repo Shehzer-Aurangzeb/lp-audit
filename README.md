@@ -9,36 +9,40 @@ Rules decide what is broken. AI (Ollama) only writes the summary. One Claude Cod
 
 ## How to use it for every landing page
 
-Before launch:
+Before launch, one command:
 
 ```
-lp-audit code C:\Sites\my-page --url https://staging-or-live-url/    # code check, 30 s
-# run the Claude command printed at the end of the report (one pass)
-lp-audit learn                                                       # Claude's new findings become rules
-lp-audit prelaunch https://the-page-url/                             # speed test + GTmetrix once, 4 min
+lp-audit launch https://the-page-url/ --code C:\Sites\my-page
 ```
 
-Fix the problems. Run `code` and `prelaunch` again until they pass. Do the last `prelaunch` on the real domain, because the Cloudflare cache check only works there.
+It runs the code check, then the speed test, the form and tracking test and the Google Ads basics, and ends with **READY** or **NOT READY**. Run the Claude command printed at the end of the code report once per site. Fix the problems and run `launch` again until it says READY. Do the last run on the real domain, because the Cloudflare cache check only works there. GTmetrix runs once, and only when the code has no must-fix problems (free plan: 5 tests).
 
-While ads are running (a few days after start, then every week or after any change):
+While ads are running (a few days after start, then after any change):
 
 ```
 lp-audit live https://the-page-url/
+lp-audit weekly https://the-page-url/     # Windows: every Monday; a window opens only if real visitors got slower
 ```
 
-Reports: `reports/<domain>/<date>_<mode>/report.md` in this folder (`lp-audit open` opens it).
+Once a month: `lp-audit learn` turns Claude's findings into rules. Commit and push `code_rules.json` and `manual_checklist.json`; the others get them with `lp-audit update`.
+
+Reports: `reports/<domain>/<date>_<mode>/report.md` in this folder (`lp-audit open` opens it). Each report starts with **In short**: the verdict, the main cause, and what changed since the last audit (fixed / new / still failing). Problems with one cause are shown together: on our first real page, 8 of 11 problems were the same chat widget.
 
 ## What each check does
 
 | Command | Checks |
 | --- | --- |
-| `prelaunch` | Lighthouse 3x on phone and desktop (on Google's servers in the USA when `GOOGLE_API_KEY` is set), real-visitor test (waits 15 s, scrolls, finds what jumps and what keeps loading), server checks (backend time, Cloudflare cache, the ad-click URL with `?gclid=` and `utm_`, private files like `.git` or `.env` downloadable from the server), GTmetrix 1x |
+| `launch` | `code` + `prelaunch`, then READY / NOT READY (must-fix = severity 1 in either) |
+| `prelaunch` | Lighthouse 3x on phone and desktop (on Google's servers in the USA when `GOOGLE_API_KEY` is set), real-visitor test (waits 15 s, scrolls, finds what jumps and what keeps loading, phone screenshots at 1 s, 3 s, 15 s), form and tracking test, Google Ads basics, server checks (Cloudflare cache, ad-click URL, response time), GTmetrix 1x |
 | `live` | Same as prelaunch (GTmetrix only with `--gtmetrix`), plus real users: Google Chrome data (28 days) and Cloudflare Web Analytics (7 days) |
-| `code` | Our rules (`code_rules.json`: debug output, passwords in code, SQL injection, unescaped input, forms without CSRF token, test content...), php -l, PHPStan, Semgrep, gitleaks, files that must not be uploaded. With `--url`: speed problems linked to the exact code line, and live CSS/JS compared with your folder. Saves the code version with git in `reports/.snapshots/` (never inside the site folder, nothing leaves the laptop) |
+| `watch` / `weekly` | `live --runs 1 --no-ai`; warns only when Cloudflare's 7-day phone or desktop LCP, INP or CLS is over target and 20% worse than the last live audit (and has 30+ visits) |
+| `code` | Our rules (`code_rules.json`: debug output, passwords in code, SQL injection, unescaped input, forms without CSRF token, test content...), php -l, PHPStan, Semgrep, gitleaks, files that must not be uploaded. With `--url`: speed problems linked to the exact code line, and live CSS/JS compared with your folder. Saves the code version with local git (nothing leaves the laptop). Skips `*.min.js` / `*.min.css`. A line with the comment `lp-audit: ok` is not reported |
 | `learn` | Checks each rule Claude proposes (catches its bad example, not the fixed one, not a duplicate, not too many hits) and adds the ones you approve |
-| `rules` | How often each rule fired, false alarms, export/import to share rules with the team |
+| `rules` | How often each rule fired or was silenced with `lp-audit: ok` |
 
-Try the code check on the demo site with planted mistakes: `lp-audit code samples/demo-site`.
+**Form and tracking test.** A phone browser opens the ad-click URL, fills the visible form fields with test data (honeypot fields stay empty), and presses Submit. It records Google Tag Manager, gtag.js, Google Ads conversion and remarketing, GA4 and the Meta pixel. Every tracking request is blocked after it is seen, so nothing is counted in Google Ads or Meta. By default the form request is blocked too, so no lead is created. `--submit` sends it for real (use on staging) and checks the thank-you page; `--thank-you <url>` opens the thank-you page to check the conversion there. Fails when: no Google tag, the conversion fires when the page opens, no conversion after Submit, the form sends nothing, or a PHP error / 404 after Submit.
+
+**Google Ads basics.** robots.txt must not block AdsBot (it ignores `User-agent: *`), links and images must not be broken (404/410/5xx), and a few Lighthouse checks from the SEO, best-practices and accessibility categories (viewport, font size, https, console errors, form labels, contrast). The AdsBot fetch from the laptop is shown as a hint only: Cloudflare checks real bots by IP.
 
 ## Files
 
@@ -53,7 +57,9 @@ Try the code check on the demo site with planted mistakes: `lp-audit code sample
 
 ## Limits
 
-- GTmetrix free plan: 5 tests per account, one account per person. The tool runs it once per launch and skips it when no tests are left.
+- GTmetrix free plan: 5 tests per account, one account per person. The tool runs it once per launch and skips it when no tests are left. If the auto-login fails, run the test by hand and pass the report link with `--gtmetrix-url`.
 - Google real-user data needs enough Chrome visitors. New pages show whole-site data first.
 - Backend time is server work only (like GTmetrix 'Backend Duration'), so it does not depend much on where you test from.
 - Raw test data is deleted after 30 days. Reports stay. About 3-5 MB per audit.
+- The form test uses fake data that fits most forms. A CAPTCHA or a strict phone format can stop it; the report then says so and you test one lead by hand.
+- `weekly` is Windows only (Task Scheduler). Docker Desktop must be running on Monday; if it is not, a window says so.

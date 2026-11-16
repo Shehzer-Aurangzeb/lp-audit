@@ -91,15 +91,15 @@ Check: it ends with **demo ok**.
 Keep each site's code in its own folder on your laptop.
 
 **Before launch**
-1. `lp-audit code C:\Sites\my-page --url https://the-page-url/` (or run `lp-audit code` inside the site folder)
-2. Copy the Claude command at the end of the report, run it in the site folder (one pass)
-3. `lp-audit learn`: answer `y` for good new rules
-4. `lp-audit prelaunch https://the-page-url/`
-5. Fix, repeat 1 and 4 until no problems. Last `prelaunch` on the real domain.
+1. `lp-audit launch https://the-page-url/ --code C:\Sites\my-page`
+2. Copy the Claude command at the end of the code report, run it in the site folder (one pass)
+3. Fix, run 1 again until it says READY. Last run on the real domain.
 
-**While ads run:** `lp-audit live https://the-page-url/` a few days after start, then every week.
+**While ads run:** `lp-audit live https://the-page-url/` a few days after start. Then `lp-audit weekly https://the-page-url/` once: it checks every Monday and opens a window only if real visitors got slower.
 
-**Share new rules:** whoever added rules runs `lp-audit rules export` and sends the zip. The other person puts it in `reports\` and runs `lp-audit rules import <zip name>`.
+**Once a month:** `lp-audit learn`: answer `y` for good new rules.
+
+**Share new rules:** rules live in this Git repo. Whoever ran `lp-audit learn` commits and pushes `code_rules.json` and `manual_checklist.json`; the other person runs `lp-audit update`.
 
 ## 7. Updates
 

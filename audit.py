@@ -9,8 +9,9 @@ Lab tests (Lighthouse), a real-visitor test (Chrome waits, scrolls, records),
 server checks, one GTmetrix run, fixed rules from rules.json, and a short
 report. Ollama only writes the summary; the rules decide what is broken.
 """
-import argparse, datetime, gzip, html.parser, json, os, re, shutil, sqlite3
-import statistics, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request, zipfile
+import argparse, concurrent.futures, datetime, gzip, html.parser, json, os, re, shutil, sqlite3
+import statistics, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request, urllib.robotparser
+from collections import Counter
 from pathlib import Path
 
 DATA = Path(os.environ.get("REPORTS_DIR", "/data/reports"))
@@ -45,10 +46,13 @@ def chrome_path():
 
 # ---------- 1. Lighthouse ----------
 
-def lighthouse(url, preset, chrome):
+ALL_CATEGORIES = ("performance", "seo", "best-practices", "accessibility")
+
+
+def lighthouse(url, preset, chrome, categories=("performance",)):
     out = Path(tempfile.mkstemp(suffix=".json")[1])
     cmd = ["lighthouse", url, "--output=json", f"--output-path={out}", "--quiet",
-           "--only-categories=performance", f"--chrome-flags={CHROME_FLAGS}"]
+           f"--only-categories={','.join(categories)}", f"--chrome-flags={CHROME_FLAGS}"]
     if preset == "desktop":
         cmd.append("--preset=desktop")
     subprocess.run(cmd, env={**os.environ, "CHROME_PATH": chrome}, timeout=240,
@@ -63,7 +67,8 @@ def lighthouse(url, preset, chrome):
 
 def psi(url, strategy, key):
     """Same Lighthouse test, run by Google in the USA (closer to our ad visitors). Free with an API key."""
-    q = urllib.parse.urlencode({"url": url, "strategy": strategy, "category": "performance", "key": key})
+    q = urllib.parse.urlencode([("url", url), ("strategy", strategy), ("key", key)] +
+                               [("category", c.upper().replace("-", "_")) for c in ALL_CATEGORIES])  # all 4: same call, free
     try:
         with urllib.request.urlopen(f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?{q}", timeout=180) as r:
             return json.loads(r.read())["lighthouseResult"]
@@ -91,15 +96,27 @@ def lh_issues(lhr):
     """Failing Lighthouse audits/insights, worst first."""
     metrics = {"first-contentful-paint", "largest-contentful-paint", "total-blocking-time", "speed-index",
                "cumulative-layout-shift", "interactive", "max-potential-fid", "first-meaningful-paint"}
+    perf = {r["id"] for r in lhr["categories"]["performance"].get("auditRefs", [])}
     out = []
     for k, au in lhr["audits"].items():
-        if k in metrics or au.get("score") is None or au["score"] >= 0.9:
+        if k in metrics or (perf and k not in perf) or au.get("score") is None or au["score"] >= 0.9:
             continue
         if au.get("scoreDisplayMode") not in ("numeric", "binary", "metricSavings"):
             continue
         sav = sum((au.get("metricSavings") or {}).values())
         out.append({"id": k, "title": au["title"], "value": au.get("displayValue", ""), "savings": sav})
     return sorted(out, key=lambda x: -x["savings"])
+
+
+# Picked from the SEO / best-practices / accessibility categories: the ones that matter on an ad landing page.
+# Not 'is-crawlable': ad pages are often noindex on purpose, and Google Ads does not need them indexed.
+LH_BASICS = ("viewport", "font-size", "is-on-https", "errors-in-console", "label", "color-contrast", "image-aspect-ratio")
+
+
+def lh_basics(lhr):
+    a = lhr["audits"]
+    return [{"id": k, "title": a[k]["title"]} for k in LH_BASICS
+            if k in a and a[k].get("score") is not None and a[k]["score"] < 1]
 
 
 # ---------- 2. Real-visitor test ----------
@@ -139,11 +156,12 @@ def cls_windows(shifts):
     return round(best, 3)
 
 
-def visitor_test(url, device, wait_s=15):
-    """Open the page like a visitor: wait, scroll to the bottom, record what happens."""
+def visitor_test(url, device, wait_s=15, shots_dir=None):
+    """Open the page like a visitor: wait, scroll to the bottom, record what happens.
+    With shots_dir: screenshots at 1 s, 3 s and 15 s (what the visitor sees)."""
     from playwright.sync_api import sync_playwright
     host = urllib.parse.urlparse(url).hostname
-    reqs = []
+    reqs, shots = [], []
     with sync_playwright() as p:
         b = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
         ctx = b.new_context(**DEVICES[device])
@@ -152,11 +170,29 @@ def visitor_test(url, device, wait_s=15):
             ctx.new_cdp_session(page).send("Emulation.setCPUThrottlingRate", {"rate": 4})
         page.add_init_script(OBSERVE_JS)
         t0 = time.time()
-        page.on("request", lambda r: reqs.append((round((time.time() - t0) * 1000), r.url, r.resource_type)))
-        page.goto(url, wait_until="load", timeout=60000)
-        load_ms = round((time.time() - t0) * 1000)
-        page.wait_for_timeout(wait_s * 1000)
-        scroll_ms = round((time.time() - t0) * 1000)
+        elapsed = lambda: (time.time() - t0) * 1000
+
+        def shot(at_s):
+            if not shots_dir:
+                return
+            page.wait_for_timeout(max(0, at_s * 1000 - elapsed()))
+            name = f"{device}_{at_s}s.jpg"
+            try:  # ponytail: a screenshot takes ~0.1-0.5 s of the throttled CPU; blocking time can read slightly higher
+                page.screenshot(path=str(shots_dir / name), type="jpeg", quality=60, scale="css", timeout=10000)
+                shots.append({"at": f"{elapsed() / 1000:.0f} s", "file": f"{shots_dir.name}/{name}"})
+            except Exception as e:
+                log(f"Screenshot at {at_s} s failed: {type(e).__name__}")
+
+        page.on("request", lambda r: reqs.append((round(elapsed()), r.url, r.resource_type)))
+        page.goto(url, wait_until="commit", timeout=60000)
+        shot(1)
+        shot(3)
+        page.wait_for_load_state("load", timeout=60000)
+        load_ms = round(page.evaluate("(performance.getEntriesByType('navigation')[0] || {}).loadEventEnd || 0") or elapsed())
+        end = time.time() + wait_s
+        shot(15)
+        page.wait_for_timeout(max(0, (end - time.time()) * 1000))
+        scroll_ms = round(elapsed())
         h = page.evaluate("document.body.scrollHeight")
         for _ in range(0, h, 400):  # scroll like a person
             page.mouse.wheel(0, 400)
@@ -178,8 +214,159 @@ def visitor_test(url, device, wait_s=15):
         "blocking_ms": sum(max(0, t["d"] - 50) for t in lp["long"]),
         "blocking_after_load_ms": sum(max(0, t["d"] - 50) for t in tasks_after_load),
         "quiet_s": round(max(before_scroll) / 1000, 1) if before_scroll else None,
-        "requests": len(reqs), "late_requests": late[:25],
+        "requests": len(reqs), "late_requests": late[:25], "screenshots": shots,
     }
+
+
+# ---------- 2b. Form and conversion tracking ----------
+
+# (name, URL pattern, counts something). Requests that count something are blocked after we see them,
+# so the test never adds a conversion in Google Ads or Meta.
+# ponytail: Google and Meta change these URLs now and then; add the new one here when a tag stops being seen
+TRACKERS = (
+    ("Google Tag Manager", r"googletagmanager\.com/gtm\.js", False),
+    ("Google tag (gtag.js)", r"googletagmanager\.com/gtag/js", False),
+    ("Meta pixel", r"connect\.facebook\.net/[^/]+/fbevents\.js", False),
+    ("Google Ads conversion", r"googleadservices\.com/pagead/conversion/|google\.[a-z.]+/pagead/1p-conversion/"
+                              r"|googleads\.g\.doubleclick\.net/pagead/conversion/", True),
+    ("Google Ads remarketing", r"googleads\.g\.doubleclick\.net/pagead/viewthroughconversion/|google\.[a-z.]+/pagead/1p-user-list/", True),
+    ("GA4", r"google-analytics\.com/(g/)?collect|analytics\.google\.com/g/collect", True),
+    ("Meta event", r"facebook\.com/tr[/?]", True),
+)
+GOOGLE_TAGS = {"Google Tag Manager", "Google tag (gtag.js)"}
+PHP_ERROR = re.compile(r"(Fatal error|Parse error|Warning|Notice|Deprecated|Uncaught \w+)\s*:.{0,200}?on line \d+", re.S)
+
+
+def tracker(u):
+    return next(((name, counts) for name, rx, counts in TRACKERS if re.search(rx, u)), None)
+
+
+def hit_detail(name, u):
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
+    if name == "Meta event":
+        return (q.get("ev") or [""])[0]
+    if name.startswith("Google Ads"):
+        return (re.search(r"/(?:conversion|viewthroughconversion|1p-conversion|1p-user-list)/(\d+)", u) or [None, ""])[1] + \
+               (f" label {q['label'][0]}" if q.get("label") else "")
+    if name == "GA4":
+        return (q.get("en") or [""])[0]
+    return ""
+
+
+def test_value(typ, name):
+    """Fake but valid test data. 555-01xx phone numbers do not exist; example.com never receives mail."""
+    if typ == "email" or "mail" in name:
+        return "lp-audit-test@example.com"
+    if typ == "tel" or re.search(r"phone|tel|mobile|cell", name):
+        return "2025550143"
+    if re.search(r"zip|postal", name):
+        return "10001"
+    return {"number": "1", "date": "2030-01-15", "url": "https://example.com"}.get(typ, "LP Audit Test")
+
+
+def tracking_test(url, submit=False, thank_you=None):
+    """Fill the lead form like a phone visitor and record which tracking tags fire.
+    Without submit=True the form request is blocked too: no test lead reaches the CRM or the inbox."""
+    from playwright.sync_api import sync_playwright
+    hits, sent, docs, phase = [], [], [], ["load"]
+    out = {"submit": submit, "thank_you": thank_you, "errors": []}
+
+    sends = lambda r: r.method == "POST" or r.resource_type in ("document", "xhr", "fetch")
+
+    def route(r):
+        t = tracker(r.request.url)
+        if t and t[1]:
+            return r.abort()   # seen (request event below), never counted
+        if not t and not submit and phase[0] == "submit" and sends(r.request):
+            return r.abort()   # the form itself: blocked in a dry run
+        return r.continue_()
+
+    def on_request(r):
+        t = tracker(r.url)
+        if t:
+            hits.append({"phase": phase[0], "tag": t[0], "detail": hit_detail(t[0], r.url)})
+        elif phase[0] == "submit" and sends(r):
+            sent.append(f"{r.method} {r.url[:150]}")
+
+    with sync_playwright() as p:
+        b = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+        ctx = b.new_context(**DEVICES["mobile"])
+        ctx.route("**/*", route)
+        page = ctx.new_page()
+        page.on("request", on_request)
+        page.on("response", lambda r: r.request.is_navigation_request() and r.frame == page.main_frame
+                and docs.append({"phase": phase[0], "url": r.url[:150], "status": r.status}))
+        try:
+            ad_url = url + ("&" if "?" in url else "?") + urllib.parse.urlencode({k: v.format(n=3) for k, v in AD_PARAMS.items()})
+            page.goto(ad_url, wait_until="load", timeout=60000)
+            page.wait_for_timeout(4000)
+            page.mouse.wheel(0, 300)       # some sites load GTM on the first scroll or touch
+            page.wait_for_timeout(6000)
+            form = page.locator("form:has(input[type=email]), form:has(input[type=tel]), form:has(input[name*=mail i])").first
+            if not form.count():
+                form = page.locator("form:has(button), form:has(input[type=submit])").first
+            out["form"] = bool(form.count())
+            if out["form"]:
+                out["captcha"] = page.locator("iframe[src*=recaptcha], iframe[src*=hcaptcha], .g-recaptcha, .cf-turnstile").count() > 0
+                filled = []
+                for el in form.locator("input, textarea, select").all():
+                    try:
+                        if not el.is_visible():   # hidden fields and honeypots stay empty
+                            continue
+                        typ = (el.get_attribute("type") or "text").lower()
+                        name = (el.get_attribute("name") or el.get_attribute("id") or "").lower()
+                        if typ in ("submit", "button", "hidden", "image", "reset", "file"):
+                            continue
+                        if el.evaluate("e => e.tagName") == "SELECT":
+                            if el.locator("option").count() > 1:
+                                el.select_option(index=1)
+                        elif typ in ("checkbox", "radio"):
+                            el.check(timeout=3000)
+                        else:
+                            el.fill(test_value(typ, name), timeout=3000)
+                        filled.append(name or typ)
+                    except Exception:
+                        pass
+                out["filled"] = filled
+                out["invalid"] = form.evaluate("f => [...f.elements].filter(e => e.willValidate && !e.checkValidity()).map(e => e.name || e.type)")
+                phase[0] = "submit"
+                btn = form.locator("button[type=submit], input[type=submit], button:not([type])").first
+                if btn.count():
+                    btn.click(timeout=5000)
+                else:
+                    form.evaluate("f => f.requestSubmit()")
+                page.wait_for_timeout(8000)
+                out["sent_to"] = sent[:3]
+                out["after_url"] = page.url[:150]
+                nav = [d for d in docs if d["phase"] == "submit"]
+                if submit and nav and nav[-1]["status"] >= 400:
+                    out["errors"].append(f"After Submit the page answered {nav[-1]['status']}: {nav[-1]['url']}")
+            if thank_you:
+                phase[0] = "thank-you"
+                r = page.goto(thank_you, wait_until="load", timeout=60000)
+                page.wait_for_timeout(6000)
+                if r and r.status >= 400:
+                    out["errors"].append(f"Thank-you page answered {r.status}: {thank_you}")
+            if phase[0] != "load":
+                m = PHP_ERROR.search(page.inner_text("body")[:20000])
+                if m:
+                    out["errors"].append("PHP error on the page after Submit: " + " ".join(m[0].split())[:200])
+        finally:
+            b.close()
+    on_load = {h["tag"] for h in hits if h["phase"] == "load"}
+    conv = lambda phases: [h for h in hits if h["phase"] in phases and h["tag"] == "Google Ads conversion"]
+    tested = bool(out.get("form") and submit) or bool(thank_you)
+    out.update({
+        "hits": hits[:40], "tags_on_load": sorted(on_load),
+        "no_google_tag": not (GOOGLE_TAGS & on_load),
+        "conversion_on_load": bool(conv(("load",))),
+        "conversion_after_submit": bool(conv(("submit", "thank-you"))),
+        # only a finding when we really reached the thank-you step; a dry run cannot see a thank-you-page tag
+        "no_conversion": None if not tested else not conv(("submit", "thank-you")),
+        "form_not_sent": None if not out.get("form") else not sent,
+        "meta_no_pageview": "Meta pixel" in on_load and not any(h["tag"] == "Meta event" and h["phase"] == "load" for h in hits),
+    })
+    return out
 
 
 # ---------- 3. Server + HTML checks ----------
@@ -187,11 +374,14 @@ def visitor_test(url, device, wait_s=15):
 class _Html(html.parser.HTMLParser):
     def __init__(self):
         super().__init__()
-        self.ext, self.img_no_size, self.classes, self.form_token = set(), 0, set(), False
+        self.ext, self.img_no_size, self.classes, self.form_token, self.links = set(), 0, set(), False, {}
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         self.classes.update((a.get("class") or "").split())
+        ref = a.get("href") if tag == "a" else a.get("src") if tag == "img" else None
+        if ref and not ref.startswith(("#", "mailto:", "tel:", "javascript:", "data:", "sms:")):
+            self.links.setdefault(ref.strip(), "image" if tag == "img" else "link")
         src = a.get("src") if tag in ("script", "img", "iframe") else a.get("href") if tag == "link" else None
         if src and src.startswith(("http", "//")):
             self.ext.add(urllib.parse.urlparse(src if src.startswith("http") else "https:" + src).hostname)
@@ -205,7 +395,73 @@ def parse_html(text, own_host):
     p = _Html()
     p.feed(text)
     return {"external": sorted(h for h in p.ext if h and h != own_host and not h.endswith("." + own_host)),
-            "img_no_size": p.img_no_size, "classes": sorted(p.classes), "form_token": p.form_token}
+            "img_no_size": p.img_no_size, "classes": sorted(p.classes), "form_token": p.form_token,
+            "links": [[kind, ref] for ref, kind in p.links.items()]}
+
+
+def http_status(u):
+    for method in ("HEAD", "GET"):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(u, method=method, headers={"User-Agent": UA}), timeout=15) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            if method == "HEAD" and e.code in (403, 405, 501):  # some servers refuse HEAD: try GET
+                continue
+            return e.code
+        except Exception:
+            return None
+
+
+def broken_links(url, links, limit=60):
+    """Links and images on the page that are broken: 404/410, server error, or no answer.
+    403/429 are not counted: many sites (Facebook, Instagram) refuse scripts but work for people."""
+    urls = {}
+    for kind, ref in links:
+        full = urllib.parse.urljoin(url, ref).split("#")[0]
+        if full.startswith("http") and full.rstrip("/") != url.split("#")[0].rstrip("/"):
+            urls.setdefault(full, kind)
+    todo = list(urls.items())[:limit]
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        codes = list(pool.map(lambda kv: http_status(kv[0]), todo))
+    return [{"url": u[:150], "kind": k, "status": c or "no answer"} for (u, k), c in zip(todo, codes)
+            if c is None or c in (404, 410) or c >= 500]
+
+
+ADSBOT_UA = ("Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) "
+             "Chrome/131.0 Mobile Safari/537.36 (compatible; AdsBot-Google-Mobile; +http://www.google.com/mobile/adsbot.html)")
+
+
+def robots_blocks(text, url):
+    """Which AdsBots robots.txt blocks. AdsBot ignores 'User-agent: *': only groups that name it count."""
+    blocked = []
+    for bot in ("AdsBot-Google", "AdsBot-Google-Mobile"):
+        rp = urllib.robotparser.RobotFileParser()
+        rp.parse(text.splitlines())
+        rp.default_entry = None  # drop the '*' group
+        if not rp.can_fetch(bot, url):
+            blocked.append(bot)
+    return blocked
+
+
+def adsbot_check(url):
+    """Google Ads checks every landing page with AdsBot. Blocked = 'Destination not working' disapprovals."""
+    u = urllib.parse.urlparse(url)
+    try:
+        req = urllib.request.Request(f"{u.scheme}://{u.netloc}/robots.txt", headers={"User-Agent": UA})
+        text = urllib.request.urlopen(req, timeout=15).read(200_000).decode("utf-8", "replace")
+    except Exception:
+        text = ""  # no robots.txt = nothing blocked
+    out = {"blocked_by_robots": robots_blocks(text, url)}
+    # ponytail: this AdsBot is fake (laptop IP). Cloudflare checks real bots by IP, so the answer is only a hint, never a rule.
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": ADSBOT_UA}), timeout=30) as r:
+            out["fetch"] = {"status": r.status, "challenge": False}
+    except urllib.error.HTTPError as e:
+        body = e.read(5000).decode("utf-8", "replace")
+        out["fetch"] = {"status": e.code, "challenge": bool(e.headers.get("cf-mitigated")) or "Just a moment" in body}
+    except Exception as e:
+        out["fetch"] = {"status": f"no answer ({type(e).__name__})", "challenge": False}
+    return out
 
 
 def backend_ms(url):
@@ -299,10 +555,15 @@ def to_ms(v):
     return None if not m else float(m[1]) * (1 if m[2] == "ms" else 1000)
 
 
-def gtmetrix(url, state_file):
+GT_MANUAL = ("Run the test by hand on https://gtmetrix.com, then give the report link: "
+             "lp-audit prelaunch <url> --gtmetrix-url https://gtmetrix.com/reports/...")
+
+
+def gtmetrix(url, state_file, report_url=None):
+    """One GTmetrix run with the dev's free account. With report_url: only read a report the dev ran by hand (uses no test)."""
     email, pw = os.environ.get("GTMETRIX_EMAIL"), os.environ.get("GTMETRIX_PASSWORD")
-    if not (email and pw):
-        return {"skipped": "No GTMETRIX_EMAIL / GTMETRIX_PASSWORD in .env"}
+    if not report_url and not (email and pw):
+        return {"skipped": "No GTMETRIX_EMAIL / GTMETRIX_PASSWORD in .env. " + GT_MANUAL}
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         b = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
@@ -310,6 +571,11 @@ def gtmetrix(url, state_file):
                             viewport={"width": 1280, "height": 1000}, user_agent=UA)
         page = ctx.new_page()
         try:
+            if report_url:
+                page.goto(report_url, timeout=60000)
+                page.wait_for_timeout(3000)
+                r = page.evaluate(GT_SCRAPE_JS)
+                return r if r.get("perf") else {"error": "Could not read that GTmetrix report. Check the link (it must open without login)."}
             page.goto("https://gtmetrix.com/dashboard/account", timeout=60000)
             if "/dashboard" not in page.url:  # not logged in yet
                 page.goto("https://gtmetrix.com/login.html", timeout=60000)
@@ -320,7 +586,7 @@ def gtmetrix(url, state_file):
                 page.goto("https://gtmetrix.com/dashboard/account", timeout=60000)
             used = re.search(r"On-Demand Tests Used\s*(\d+)\s*of\s*(\d+)", page.inner_text("body"))
             if used and int(used[1]) >= int(used[2]):
-                return {"skipped": f"GTmetrix free tests used up ({used[1]} of {used[2]}). Run it manually later."}
+                return {"skipped": f"GTmetrix free tests used up ({used[1]} of {used[2]}). " + GT_MANUAL}
             page.goto("https://gtmetrix.com/dashboard/", timeout=60000)
             page.fill("input[type=url]", url)
             page.locator("button[type=submit]:has-text('Analyze')").first.click()
@@ -333,7 +599,7 @@ def gtmetrix(url, state_file):
             r["tests_used"] = f"{int(used[1]) + 1} of {used[2]}" if used else None
             return r
         except Exception as e:  # ponytail: login/CAPTCHA/page changes all end here; GTmetrix stays a manual check then
-            return {"error": f"GTmetrix step failed ({type(e).__name__}). Run it manually: https://gtmetrix.com"}
+            return {"error": f"GTmetrix step failed ({type(e).__name__}). " + GT_MANUAL}
         finally:
             b.close()
 
@@ -457,11 +723,85 @@ def evaluate(rules, facts):
     return sorted(failed, key=lambda r: r.get("severity", 3))
 
 
-# ---------- 6. Report ----------
+# ---------- 6. Causes, verdict, compare ----------
+
+# Known third parties: one name for the element that jumps and for the scripts that keep loading.
+VENDORS = {"Chat widget": r"chat|livechat|tawk|intercom|crisp|zendesk|drift|tidio",
+           "Google Tag Manager / Analytics": r"googletagmanager|google-analytics|gtag",
+           "Meta pixel": r"facebook|fbevents", "Hotjar": r"hotjar", "Microsoft Clarity": r"clarity\.ms"}
+
+
+def cause_name(kind, facts):
+    """Root cause for a group of rules (rules.json 'cause'): shift = what jumps, busy = what keeps loading, cache = Cloudflare."""
+    if kind == "cache":
+        return "Page not cached by Cloudflare" if get(facts, "server.cache") not in CACHED else None
+    if kind == "shift":
+        top = max(get(facts, "visitor.shifts") or [], key=lambda s: s["v"], default=None)
+        text = top and top["el"]
+    else:
+        hosts = [urllib.parse.urlparse(x["url"]).hostname for d in ("mobile", "desktop")
+                 for x in get(facts, f"visitor.{d}.late_requests") or []]
+        text = max(set(hosts), key=hosts.count) if hosts else None
+    if not text:
+        return None
+    return next((n for n, rx in VENDORS.items() if re.search(rx, text, re.I)), text)
+
+
+def group_causes(failed, facts):
+    """Problems with one root cause sit together, most important group first.
+    On the first real page, 8 of 12 problems were the same LiveChat widget."""
+    names = {k: cause_name(k, facts) for k in {r.get("cause") for r in failed} if k}
+    for r in failed:
+        r["cause_name"] = names.get(r.get("cause"))
+    count = Counter(r["cause_name"] for r in failed if r["cause_name"])
+    for r in failed:
+        if count[r["cause_name"]] < 2:
+            r["cause_name"] = None
+    best = {}
+    for r in failed:
+        if r["cause_name"]:
+            best[r["cause_name"]] = min(best.get(r["cause_name"], 9), r.get("severity", 3))
+    key = lambda r: (best[r["cause_name"]], -count[r["cause_name"]], r["cause_name"], r.get("severity", 3)) \
+        if r["cause_name"] else (r.get("severity", 3), -1, "~", r.get("severity", 3))
+    return sorted(failed, key=key)
+
+
+def verdict(failed, mode):
+    must = [r for r in failed if r.get("severity", 3) == 1]
+    ok, bad = ("OK", "NEEDS FIX") if mode == "live" else ("READY", "NOT READY")
+    return (bad if must else ok), must
+
+
+def compare(prev_failed, failed):
+    """Rule ids are stable, so two audits compare by id."""
+    before = {r["id"]: r["title"] for r in prev_failed}
+    now = {r["id"]: r["title"] for r in failed}
+    return {"fixed": [t for i, t in before.items() if i not in now], "new": [t for i, t in now.items() if i not in before],
+            "still": [t for i, t in now.items() if i in before]}
+
+
+def summary_lines(mode, facts, failed, cmp):
+    word, must = verdict(failed, mode)
+    L = [f"**{word}**: {len(must)} must-fix problem(s), {len(failed) - len(must)} smaller. "
+         f"Phone score {fmt(get(facts, 'lab.mobile.score'))}, desktop {fmt(get(facts, 'lab.desktop.score'))}.", ""]
+    causes = Counter(r["cause_name"] for r in failed if r.get("cause_name"))
+    if causes:
+        L += ["Main cause: " + "; ".join(f"{n} ({c} problems)" for n, c in causes.most_common()) + ".", ""]
+    if cmp:
+        L += [f"Since the last audit ({cmp['when']}): {len(cmp['fixed'])} fixed, {len(cmp['new'])} new, "
+              f"{len(cmp['still'])} still failing.", ""]
+        L += [f"- Fixed: {t}" for t in cmp["fixed"]] + [f"- New: {t}" for t in cmp["new"]]
+        L += [""] if cmp["fixed"] or cmp["new"] else []
+    return L
+
+
+# ---------- 7. Report ----------
 
 def fmt(v, key=""):
     if v is None:
         return "-"
+    if isinstance(v, bool):
+        return "yes" if v else "no"
     if key.endswith("_ms"):
         return f"{v / 1000:.1f} s" if v >= 1000 else f"{v:.0f} ms"
     if key.endswith("_kb"):
@@ -473,10 +813,15 @@ def fmt(v, key=""):
     return str(v)
 
 
-def render(url, mode, when, facts, failed, lh_top, ai_summary):
+def render(url, mode, when, facts, failed, lh_top, ai_summary, cmp=None):
     L = [f"# Speed audit: {url}", "", f"{when} · mode: {mode} · rules failed: {len(failed)}", ""]
+    L += ["## In short", ""] + summary_lines(mode, facts, failed, cmp)
     if ai_summary:
         L += ["## Summary", "", ai_summary.strip(), ""]
+    shots = get(facts, "visitor.mobile.screenshots") or []
+    if shots:
+        L += ["## What a phone visitor sees", "", "| " + " | ".join(s["at"] for s in shots) + " |",
+              "|" + " --- |" * len(shots), "| " + " | ".join(f"![{s['at']}]({s['file']})" for s in shots) + " |", ""]
     L += ["## Results (middle of runs)", "", f"Lab tests: {get(facts, 'lab.source') or '-'}.", "", "| Check | Phone | Desktop | Target |", "| --- | --- | --- | --- |"]
     rows = [("Lighthouse score", "lab.{}.score", "", "90+"), ("LCP (lab)", "lab.{}.lcp_ms", "_ms", "2.5 s"),
             ("TBT (lab)", "lab.{}.tbt_ms", "_ms", "200 ms"),
@@ -526,11 +871,44 @@ def render(url, mode, when, facts, failed, lh_top, ai_summary):
         if get(field, "cloudflare.rum_fields"):
             notes.append("Cloudflare fields available: " + ", ".join(field["cloudflare"]["rum_fields"]))
         L += ["", "; ".join(dict.fromkeys(notes)) + ".", ""] if notes else [""]
+    tr = facts.get("tracking")
+    if tr:
+        L += ["## Form and tracking", ""]
+        L.append(f"Tags when the page opens: {', '.join(tr['tags_on_load']) or 'none'}.")
+        if tr.get("form"):
+            fired = sorted({f"{h['tag']} {h['detail']}".strip() for h in tr["hits"] if h["phase"] != "load"})
+            L.append(f"Form filled with test data ({', '.join(tr.get('filled') or []) or 'no fields'}). "
+                     f"After Submit: {', '.join(fired) or 'no tracking request'}.")
+            if tr.get("invalid"):
+                L.append(f"Fields the browser did not accept: {', '.join(tr['invalid'])}.")
+            if tr.get("captcha"):
+                L.append("The form has a CAPTCHA: a bot test can be blocked. Test one lead by hand.")
+            L.append(f"Form sends to: {', '.join(tr.get('sent_to') or []) or 'nothing'}"
+                     + (" (sent for real: test lead 'LP Audit Test')." if tr["submit"] else
+                        " (blocked: no test lead was created. Use --submit on staging to test the thank-you page)."))
+        else:
+            L.append("No form found on the page.")
+        if tr.get("no_conversion") is None and not tr.get("conversion_after_submit"):
+            L.append("Conversion after Submit not tested: give --thank-you <url>, or run with --submit on staging.")
+        L += ["Tracking requests were blocked after we saw them: nothing was counted in Google Ads or Meta.", ""]
+    ab = facts.get("adsbot") or {}
+    if ab.get("fetch"):
+        f = ab["fetch"]
+        L += [f"AdsBot (Google Ads checker) test from this laptop: answer {f['status']}"
+              + (". Cloudflare showed it a challenge. Real AdsBot comes from Google and is usually let through, but check "
+                 "Cloudflare > Security > Events for 'AdsBot' and make sure nothing is blocked." if f["challenge"] else ".")
+              + f" robots.txt: {'blocks ' + ', '.join(ab['blocked_by_robots']) if ab.get('blocked_by_robots') else 'does not block AdsBot'}.", ""]
     L += ["## Problems to fix", ""] if failed else ["## Problems to fix", "", "None. All rules passed.", ""]
+    group = None
     for i, r in enumerate(failed, 1):
+        if r.get("cause_name") and r["cause_name"] != group:
+            n = sum(x.get("cause_name") == r["cause_name"] for x in failed)
+            L += [f"> **One cause, {n} problems: {r['cause_name']}.** Fix this first: the next {n} problems share it.", ""]
+        group = r.get("cause_name")
         ev = r["evidence"]
-        ev = "; ".join(f"{x.get('el', x)} ({x.get('v', 0):.2f})" if isinstance(x, dict) else str(x) for x in ev) \
-            if isinstance(ev, list) else fmt(ev, r.get("metric", ""))
+        ev = "; ".join((f"{x['el']} ({x.get('v', 0):.2f})" if "el" in x else
+                        " ".join(str(x[k]) for k in ("status", "kind", "url", "title") if k in x)) if isinstance(x, dict) else str(x)
+                       for x in ev) if isinstance(ev, list) else fmt(ev, r.get("metric", ""))
         L += [f"### {i}. {r['title']}", "", f"**Found:** {ev}", ""] + [f"- {f}" for f in r["fix"]] + \
              ["", f"**Check:** {r['check']}", ""]
     shifts = get(facts, "visitor.shifts") or []
@@ -641,6 +1019,9 @@ def cmd_audit(args):
     facts["server"]["ad_click"] = {**ad, "cache_miss": plain_cached and not ad["cached"]}
     facts["server"]["exposed"] = exposed_files(url)
     facts["html"]["cached_token"] = facts["html"]["form_token"] and (plain_cached or ad["cached"])
+    log("Google Ads basics: AdsBot, robots.txt, broken links and images")
+    facts["adsbot"] = adsbot_check(url)
+    facts["html"]["broken"] = broken_links(url, facts["html"].pop("links"))
 
     chrome = chrome_path()
     key = google_key() if not args.local_lab else None
@@ -650,27 +1031,38 @@ def cmd_audit(args):
         runs = []
         for i in range(args.runs):
             log(f"Lighthouse {preset} run {i + 1}/{args.runs} ({facts['lab']['source']})")
-            lhr = (key and psi(url, preset, key)) or lighthouse(url, preset, chrome)
+            first = preset == "mobile" and i == 0  # SEO / best practices / accessibility: once is enough
+            lhr = (key and psi(url, preset, key)) or lighthouse(url, preset, chrome, ALL_CATEGORIES if first else ("performance",))
             if lhr:
                 runs.append(lh_metrics(lhr))
                 save_raw(folder, f"lighthouse_{preset}_{i + 1}", lhr)
-                if preset == "mobile" and i == 0:
+                if first:
                     lh_top = lh_issues(lhr)
+                    facts["lab"]["checks"] = lh_basics(lhr)
         facts["lab"][preset] = {k: median(r[k] for r in runs) for k in runs[0]} if runs else {}
         facts["lab"][preset]["runs"] = runs
 
     for device in ("mobile", "desktop"):
         log(f"Real-visitor test ({device}: wait 15 s, scroll, record)")
         try:
-            facts["visitor"][device] = visitor_test(url, device)
+            shots = folder / "screens" if device == "mobile" else None
+            if shots:
+                shots.mkdir(exist_ok=True)
+            facts["visitor"][device] = visitor_test(url, device, shots_dir=shots)
         except Exception as e:
             log(f"Visitor test {device} failed: {e}")
     facts["visitor"]["shifts"] = [{**s, "device": d} for d in ("mobile", "desktop")
                                   for s in get(facts, f"visitor.{d}.shifts") or [] if s["v"] >= 0.001]
 
-    if (mode == "prelaunch" and not args.no_gtmetrix) or (mode == "live" and args.gtmetrix):
-        log("GTmetrix (1 run, your free account)")
-        gt = gtmetrix(url, DATA / ".gtmetrix_state.json")
+    log("Form and tracking test (phone)" + (": REAL submit, a test lead is sent" if args.submit else ": dry run, nothing is sent"))
+    try:
+        facts["tracking"] = tracking_test(url, args.submit, args.thank_you)
+    except Exception as e:
+        log(f"Form test failed: {type(e).__name__}: {str(e)[:200]}")
+
+    if args.gtmetrix_url or (mode == "prelaunch" and not args.no_gtmetrix) or (mode == "live" and args.gtmetrix):
+        log("GTmetrix: reading your report" if args.gtmetrix_url else "GTmetrix (1 run, your free account)")
+        gt = gtmetrix(url, DATA / ".gtmetrix_state.json", args.gtmetrix_url)
         for k in ("lcp", "tbt", "fcp", "si", "tti"):
             gt[f"{k}_ms"] = to_ms(gt.get(k))
         gt["perf"] = int(gt["perf"]) if gt.get("perf") else None
@@ -682,16 +1074,21 @@ def cmd_audit(args):
         facts["field"] = {"google": crux(url, k) if k else {"skipped": "No GOOGLE_API_KEY in .env"},
                           "cloudflare": cloudflare(url)}
 
-    failed = evaluate(json.loads(RULES.read_text()), facts)
+    failed = group_causes(evaluate(json.loads(RULES.read_text()), facts), facts)
     ai = None if args.no_ai or not failed else (log("Ollama summary") or ollama_summary(failed))
 
     # site version: a very different page on the same domain starts a new history
     c = db()
     last = c.execute("SELECT version, classes FROM runs WHERE domain = ? ORDER BY ts DESC LIMIT 1", (host,)).fetchone()
     version = 1 if not last else last[0] + (fingerprint_similarity(json.loads(last[1]), facts["html"]["classes"]) < 0.5)
+    prev = c.execute("SELECT ts, folder FROM runs WHERE domain = ? AND mode = ? AND version = ? ORDER BY ts DESC LIMIT 1",
+                     (host, mode, version)).fetchone()
+    cmp = None
+    if prev and (DATA / prev[1] / "summary.json").exists():
+        cmp = {**compare(json.loads((DATA / prev[1] / "summary.json").read_text())["failed"], failed), "when": prev[0][:16].replace("T", " ")}
 
     when = f"{now:%Y-%m-%d %H:%M}"
-    report = render(url, mode, when, facts, failed, lh_top, ai)
+    report = render(url, mode, when, facts, failed, lh_top, ai, cmp)
     if last and version != last[0]:
         report = report.replace("\n\n", f"\n\nNew site version (v{version}) on this domain: history starts fresh.\n\n", 1)
     (folder / "report.md").write_text(report)
@@ -703,8 +1100,58 @@ def cmd_audit(args):
               (host, url, mode, now.isoformat(), folder_rel, version, json.dumps(facts["html"]["classes"]), json.dumps(summary)))
     c.commit()
     log(f"Done. Report: reports/{folder_rel}/report.md")
-    print(f"\nPhone {summary['mobile']} · Desktop {summary['desktop']} · {len(failed)} problem(s): "
+    print(f"\nSpeed check: {verdict(failed, mode)[0]} · Phone {summary['mobile']} · Desktop {summary['desktop']} · {len(failed)} problem(s): "
           + ", ".join(r["title"] for r in failed))
+    return failed, facts
+
+
+def cmd_launch(args):
+    """Code check, then prelaunch. Ends with READY or NOT READY."""
+    problems = cmd_code(argparse.Namespace(path=args.code, url=args.url, name=None, no_ai=args.no_ai, no_semgrep=args.no_semgrep))
+    code_must = [p for p in problems if p.get("severity", 3) == 1]
+    if code_must and not args.no_gtmetrix and not args.gtmetrix_url:
+        log("The code has must-fix problems: GTmetrix skipped to save a free test. Fix them, then run launch again.")
+        args.no_gtmetrix = True
+    args.cmd = "prelaunch"
+    failed, _ = cmd_audit(args)
+    word, speed_must = verdict(failed, "prelaunch")
+    must = [f"code: {p['title']} ({p['evidence']})" for p in code_must] + [f"speed: {r['title']}" for r in speed_must]
+    print("\n" + "=" * 60)
+    if must:
+        print(f"NOT READY: {len(must)} must-fix problem(s)")
+        print("\n".join(f"  - {m}" for m in must[:15]) + ("\n  ... see the reports" if len(must) > 15 else ""))
+    else:
+        print(f"READY ({len(problems) + len(failed)} smaller problem(s) in the reports)")
+    print("=" * 60)
+    if must:
+        sys.exit(1)
+
+
+WATCH = (("lcp_ms", 2500), ("inp_ms", 200), ("cls", 0.1))
+
+
+def got_worse(now, before, min_visits=30):
+    """Cloudflare p75 (7 days): alert only when over the target AND more than 20% worse than last time."""
+    if not now or not before or (now.get("visits") or 0) < min_visits:
+        return []
+    return [f"{k.replace('_ms', '').upper()} {fmt(before[k], k)} -> {fmt(now[k], k)} (target {fmt(t, k)})" for k, t in WATCH
+            if now.get(k) is not None and before.get(k) is not None and now[k] > t and now[k] > before[k] * 1.2]
+
+
+def cmd_watch(args):
+    """Weekly check (Task Scheduler): a live audit, alert only when Cloudflare's real-visitor data got worse."""
+    host = urllib.parse.urlparse(args.url).hostname
+    row = db().execute("SELECT folder FROM runs WHERE domain = ? AND mode = 'live' ORDER BY ts DESC LIMIT 1", (host,)).fetchone()
+    before = json.loads((DATA / row[0] / "summary.json").read_text())["facts"] if row and (DATA / row[0] / "summary.json").exists() else {}
+    args.__dict__.update(cmd="live", runs=1, no_ai=True, gtmetrix=False, gtmetrix_url=None, local_lab=False, submit=False, thank_you=None)
+    _, facts = cmd_audit(args)
+    alerts = [f"{d}: {a}" for d in ("phone", "desktop")
+              for a in got_worse(get(facts, f"field.cloudflare.{d}"), get(before, f"field.cloudflare.{d}"))]
+    for a in alerts:
+        print(f"ALERT: real visitors got slower, {a}")
+    if alerts:
+        sys.exit(3)
+    print("Weekly check: no change for the worse." if before else "Weekly check: first run, saved as the starting point.")
 
 
 # ---------- 8. Code audit ----------
@@ -723,11 +1170,16 @@ def code_files(root):
             yield p, rel.as_posix()
 
 
-def scan_patterns(root, rules, per_file=5):
-    """Our own rules: regex over every text file. Learned rules (phase 4) land in code_rules.json too."""
+SILENCE = re.compile(r"lp-audit:\s*ok", re.I)   # put this comment on a line to silence a false alarm there
+MINIFIED = re.compile(r"\.min\.(js|css)$", re.I)  # library builds: not our code, one huge line
+
+
+def scan_patterns(root, rules, per_file=5, silenced=None):
+    """Our own rules: regex over every text file. Learned rules land in code_rules.json too.
+    A line with the comment `lp-audit: ok` is skipped; its rule id goes into `silenced`."""
     hits = []
     for p, rel in code_files(root):
-        if not TEXT_FILE.search(rel) or p.stat().st_size > 2_000_000:
+        if not TEXT_FILE.search(rel) or MINIFIED.search(rel) or p.stat().st_size > 2_000_000:
             continue
         text = p.read_text(errors="replace")
         lines = text.splitlines()
@@ -742,7 +1194,12 @@ def scan_patterns(root, rules, per_file=5):
                 seen.add(n)
                 if len(seen) > per_file:
                     break
-                hits.append({"rule": r["id"], "file": rel, "line": n, "code": lines[n - 1].strip()[:160] if lines else ""})
+                code = lines[n - 1] if lines else ""
+                if SILENCE.search(code):
+                    if silenced is not None:
+                        silenced.append(r["id"])
+                    continue
+                hits.append({"rule": r["id"], "file": rel, "line": n, "code": code.strip()[:160]})
     return hits
 
 
@@ -936,7 +1393,8 @@ def cmd_code(args):
 
     rules = json.loads(CODE_RULES.read_text())
     log("Our rules (leftovers, security basics)")
-    hits = scan_patterns(root, rules)
+    silenced = []
+    hits = scan_patterns(root, rules, silenced=silenced)
     risky = [rel for _, rel in code_files(root) if RISKY_FILE.search(rel)]
     log("php -l (syntax)")
     tools = php_lint(root)
@@ -1004,19 +1462,22 @@ def cmd_code(args):
     summary = {"commit": commit, "rules": len(hits), "tools": len(tools), "risky": len(risky), "links": len(links)}
     (folder / "summary.json").write_text(json.dumps({"name": name, "path": str(root), "commit": commit, "hits": hits,
                                                      "tools": tools, "risky": risky, "links": links, "deploy": deploy, "exposed": exposed}, indent=1))
-    rule_stats(c, {h["rule"] for h in hits})
+    rule_stats(c, {h["rule"] for h in hits}, set(silenced))
     c.execute("INSERT INTO runs (domain, url, mode, ts, folder, version, classes, summary) VALUES (?,?,?,?,?,?,?,?)",
               (name, args.url, "code", now.isoformat(), folder_rel, 1, "[]", json.dumps(summary)))
     c.commit()
     log(f"Done. Report: reports/{folder_rel}/report.md")
     print(f"\n{len(problems)} problem(s): {len(hits)} from our rules, {len(tools)} from tools, {len(risky)} risky file(s), "
-          f"{len(links)} speed link(s)")
+          f"{len(links)} speed link(s)" + (f", {len(silenced)} line(s) silenced with 'lp-audit: ok'" if silenced else ""))
+    pending = pending_findings()
+    if pending and time.time() - min(p.stat().st_mtime for p in pending) > 30 * 86400:
+        print(f"\nMonthly job: {len(pending)} Claude review(s) are waiting. Run: lp-audit learn")
+    return problems
 
 
 # ---------- 9. Learning: Claude's findings become rules ----------
 
 CHECKLIST = Path(__file__).with_name("manual_checklist.json")
-RULE_FILES = ("rules.json", "code_rules.json", "manual_checklist.json")
 
 
 def check_rule(rule, existing, sample_roots):
@@ -1055,9 +1516,13 @@ def ask(q, choices):
             return a
 
 
+def pending_findings():
+    """Claude reviews not yet turned into rules. 'learn' is a monthly job, so these pile up."""
+    return [p for p in sorted(DATA.glob("*/*_code/claude_findings.json")) if not (p.parent / "learned.json").exists()]
+
+
 def cmd_learn(args):
-    pending = sorted(DATA.glob("*/*_code/claude_findings.json"))
-    pending = [p for p in pending if not (p.parent / "learned.json").exists()]
+    pending = pending_findings()
     if not pending:
         print("No new Claude findings. Run 'audit code', then the Claude command from its report.")
         return
@@ -1103,56 +1568,31 @@ def cmd_learn(args):
         (f.parent / "learned.json").write_text(json.dumps(decisions, indent=1))
     CODE_RULES.write_text("[\n" + ",\n".join("  " + json.dumps(r) for r in rules) + "\n]\n")
     CHECKLIST.write_text(json.dumps(checklist, indent=1))
-    print(f"\nAdded {added_rules} rule(s) and {added_checks} checklist item(s). "
-          f"Share them with the team: audit rules export")
+    print(f"\nAdded {added_rules} rule(s) and {added_checks} checklist item(s). Share them with the team: "
+          f"commit and push code_rules.json and manual_checklist.json; the others run 'lp-audit update'.")
 
 
-def rule_stats(c, fired):
+def rule_stats(c, fired, silenced=()):
+    # ponytail: the column keeps its old name false_alarms; it now counts audits where a hit was silenced with 'lp-audit: ok'
     c.execute("CREATE TABLE IF NOT EXISTS rule_stats (rule TEXT PRIMARY KEY, fires INTEGER DEFAULT 0, false_alarms INTEGER DEFAULT 0)")
     for rid in fired:
         c.execute("INSERT INTO rule_stats (rule, fires) VALUES (?, 1) ON CONFLICT(rule) DO UPDATE SET fires = fires + 1", (rid,))
+    for rid in silenced:
+        c.execute("INSERT INTO rule_stats (rule, false_alarms) VALUES (?, 1) "
+                  "ON CONFLICT(rule) DO UPDATE SET false_alarms = false_alarms + 1", (rid,))
 
 
 def cmd_rules(args):
     c = db()
     rule_stats(c, [])
-    if args.action == "false-alarm":
-        c.execute("INSERT INTO rule_stats (rule, false_alarms) VALUES (?, 1) "
-                  "ON CONFLICT(rule) DO UPDATE SET false_alarms = false_alarms + 1", (args.rule,))
-        c.commit()
-        print(f"Noted: {args.rule} gave a false alarm.")
-    elif args.action == "export":
-        out = DATA / f"rules-export-{datetime.date.today()}.zip"
-        with zipfile.ZipFile(out, "w") as z:
-            for name in RULE_FILES:
-                p = Path(__file__).with_name(name)
-                if p.exists():
-                    z.write(p, name)
-        print(f"Saved reports/{out.name}. Send it to the team; they run: audit rules import {out.name}")
-    elif args.action == "import":
-        added = 0
-        with zipfile.ZipFile(DATA / args.rule) as z:
-            for name in RULE_FILES:
-                if name not in z.namelist():
-                    continue
-                theirs, p = json.loads(z.read(name)), Path(__file__).with_name(name)
-                mine = json.loads(p.read_text()) if p.exists() else []
-                key = (lambda r: r.get("id") or r.get("title"))
-                have = {key(r) for r in mine}
-                new = [r for r in theirs if key(r) not in have]
-                if new:
-                    p.write_text(json.dumps(mine + new, indent=1) if name == "manual_checklist.json" else
-                                 "[\n" + ",\n".join("  " + json.dumps(r) for r in mine + new) + "\n]\n")
-                added += len(new)
-        print(f"Imported {added} new rule(s)/check(s). Rules you already had were kept as they are.")
-    else:  # list
-        stats = {r: (f, fa) for r, f, fa in c.execute("SELECT rule, fires, false_alarms FROM rule_stats")}
-        for name in ("code_rules.json", "rules.json"):
-            print(f"\n{name}")
-            for r in json.loads(Path(__file__).with_name(name).read_text()):
-                f, fa = stats.get(r["id"], (0, 0))
-                flag = "  <- noisy, review it" if f >= 5 and fa / f > 0.3 else ""
-                print(f"  {r['id']:38} fired {f:3}  false alarms {fa:3}{flag}")
+    stats = {r: (f, s) for r, f, s in c.execute("SELECT rule, fires, false_alarms FROM rule_stats")}
+    for name in ("code_rules.json", "rules.json"):
+        print(f"\n{name}")
+        for r in json.loads(Path(__file__).with_name(name).read_text()):
+            f, s = stats.get(r["id"], (0, 0))
+            flag = "  <- often silenced, review it" if s >= 3 and s > f else ""
+            print(f"  {r['id']:38} fired {f:3}  silenced {s:3}{flag}")
+    print("\nSilence a false alarm: add the comment  lp-audit: ok  on that line (// lp-audit: ok, # lp-audit: ok or <!-- lp-audit: ok -->).")
 
 
 # ---------- self-check ----------
@@ -1221,6 +1661,58 @@ def demo():
         assert not check_rule({**good_rule, "match": "target"}, existing, [root])[0]          # flags the good example
         assert not check_rule({**good_rule, "match": "(("}, existing, [root])[0]              # broken pattern
         assert "already covered" in check_rule({"match": r"var_dump\(", "bad_example": "var_dump($a);"}, existing, [root])[1][0]
+        # 'lp-audit: ok' silences one line; *.min.js is skipped
+        (root / "b.php").write_text("<?php\nvar_dump($a); // lp-audit: ok\nvar_dump($b);\n")
+        (root / "lib.min.js").write_text("console.log('x');debugger;")
+        sil = []
+        hits = scan_patterns(root, json.loads(CODE_RULES.read_text()), silenced=sil)
+        assert [h["line"] for h in hits if h["file"] == "b.php"] == [3] and sil == ["php-var-dump"], (hits, sil)
+        assert not [h for h in hits if h["file"] == "lib.min.js"]
+    # ads basics: AdsBot ignores 'User-agent: *'; picked Lighthouse audits; links parsed
+    assert robots_blocks("User-agent: *\nDisallow: /", "https://x.com/lp") == []
+    assert robots_blocks("User-agent: AdsBot-Google\nDisallow: /lp", "https://x.com/lp/a") == ["AdsBot-Google", "AdsBot-Google-Mobile"]
+    assert robots_blocks("", "https://x.com/") == []
+    lhr = {"audits": {"viewport": {"score": 0, "title": "No viewport"}, "font-size": {"score": 1, "title": "ok"},
+                      "is-crawlable": {"score": 0, "title": "noindex"}}}
+    assert lh_basics(lhr) == [{"id": "viewport", "title": "No viewport"}]
+    h = parse_html('<a href="/privacy">p</a><a href="#top">t</a><a href="tel:1">c</a><img src="a.png"><a href="/privacy">p</a>', "x.com")
+    assert h["links"] == [["link", "/privacy"], ["image", "a.png"]], h["links"]
+    basics = {"adsbot": {"blocked_by_robots": ["AdsBot-Google"]}, "lab": {"checks": [{"id": "viewport"}, {"id": "label"}]},
+              "html": {"broken": [{"url": "https://x.com/a.png", "kind": "image", "status": 404}]}}
+    ids = {r["id"] for r in evaluate(json.loads(RULES.read_text()), basics)}
+    assert {"adsbot-robots", "broken-links", "lh-phone-basics", "lh-accessibility"} <= ids, ids
+    # tracking: which request is which tag; conversion on page load is the classic GTM mistake
+    assert tracker("https://www.googletagmanager.com/gtm.js?id=GTM-X")[0] == "Google Tag Manager"
+    assert tracker("https://www.googleadservices.com/pagead/conversion/123/?label=abc") == ("Google Ads conversion", True)
+    assert tracker("https://googleads.g.doubleclick.net/pagead/viewthroughconversion/123/?x")[0] == "Google Ads remarketing"
+    assert tracker("https://www.facebook.com/tr/?id=1&ev=Lead") == ("Meta event", True) and tracker("https://x.com/send.php") is None
+    assert hit_detail("Meta event", "https://www.facebook.com/tr/?id=1&ev=Lead") == "Lead"
+    assert hit_detail("Google Ads conversion", "https://www.googleadservices.com/pagead/conversion/123/?label=abc") == "123 label abc"
+    assert test_value("text", "your_email") == "lp-audit-test@example.com" and test_value("text", "phone") == "2025550143"
+    tr = {"tracking": {"no_google_tag": False, "conversion_on_load": True, "no_conversion": None, "form_not_sent": False,
+                       "meta_no_pageview": False, "errors": []}}
+    ids = {r["id"] for r in evaluate(json.loads(RULES.read_text()), tr)}
+    assert ids == {"tracking-conversion-on-load"}, ids
+    # report: grouped by cause (the real LiveChat page: jump + late scripts = one cause), summary, compare
+    lc = {"visitor": {"shifts": [{"el": "body > div#chat-widget-container", "v": .7}],
+                      "mobile": {"cls": .7, "blocking_ms": 800, "late_requests": [{"url": "https://cdn.livechatinc.com/a.js"}]},
+                      "desktop": {"cls": .2, "quiet_s": 11.4}},
+          "server": {"cache": "DYNAMIC", "backend_ms": 935, "ttfb_ms": 990, "encoding": "gzip"}, "html": {"external": [], "img_no_size": 23}, "lab": {}}
+    failed = group_causes(evaluate(json.loads(RULES.read_text()), lc), lc)
+    names = [r.get("cause_name") for r in failed]
+    assert names.count("Chat widget") == 5 and names.count("Page not cached by Cloudflare") == 2, names
+    assert names[:5] == ["Chat widget"] * 5 and names[-1] is None, names
+    cmp = {**compare([{"id": "server-cache", "title": "Cache"}, {"id": "gone", "title": "Gone"}], failed), "when": "yesterday"}
+    assert cmp["fixed"] == ["Gone"] and "Cache" not in cmp["new"] and len(cmp["still"]) == 1
+    md = render("https://x.com/", "prelaunch", "now", lc, failed, [], None, cmp)
+    assert "**NOT READY**" in md and "Chat widget (5 problems)" in md and "1 fixed" in md and "One cause, 5 problems" in md, md
+    assert verdict([{"severity": 2}], "live")[0] == "OK" and verdict([{"severity": 1}], "prelaunch")[0] == "NOT READY"
+    # weekly alert: only when over the target AND >20% worse, and only with enough visits
+    before = {"visits": 200, "lcp_ms": 2400, "inp_ms": 150, "cls": 0.05}
+    assert got_worse({**before, "lcp_ms": 3100}, before) == ["LCP 2.4 s -> 3.1 s (target 2.5 s)"]
+    assert got_worse({**before, "lcp_ms": 2600}, before) == []                      # over target, but not 20% worse
+    assert got_worse({**before, "inp_ms": 190}, before) == []                       # worse, but under the target
+    assert got_worse({**before, "visits": 10, "cls": 0.4}, before) == [] and got_worse(before, {}) == []
     print("demo ok")
 
 
@@ -1229,18 +1721,32 @@ def main():
         return demo()
     ap = argparse.ArgumentParser(prog="audit")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name, hlp in (("prelaunch", "before launch: lab + real-visitor test + server + GTmetrix x1"),
+    def gt_link(v):
+        if not re.match(r"https://(www\.)?gtmetrix\.com/reports/", v):
+            raise argparse.ArgumentTypeError("must be a https://gtmetrix.com/reports/... link")
+        return v
+    for name, hlp in (("prelaunch", "before launch: lab + real-visitor test + form test + server + GTmetrix x1"),
+                      ("launch", "code check + prelaunch in one go, ends with READY / NOT READY"),
                       ("live", "ads running: same tests + Google and Cloudflare real-user data")):
         p = sub.add_parser(name, help=hlp)
         p.add_argument("url")
         p.add_argument("--runs", type=int, default=3)
         p.add_argument("--no-ai", action="store_true")
         p.add_argument("--local-lab", action="store_true", help="use this laptop's Lighthouse even with a Google key (e.g. staging)")
-        if name == "prelaunch":
-            p.add_argument("--no-gtmetrix", action="store_true")
-        else:
+        p.add_argument("--submit", action="store_true", help="really send the form (a test lead): use on staging")
+        p.add_argument("--thank-you", metavar="URL", help="thank-you page: check the Google Ads conversion fires there")
+        p.add_argument("--gtmetrix-url", type=gt_link, metavar="LINK", help="read a GTmetrix report you ran by hand (uses no test)")
+        if name == "live":
             p.add_argument("--gtmetrix", action="store_true", help="also run GTmetrix once (uses a free test)")
-        p.set_defaults(fn=cmd_audit)
+        else:
+            p.add_argument("--no-gtmetrix", action="store_true")
+        if name == "launch":
+            p.add_argument("--code", required=True, metavar="FOLDER", help="the site folder (the launcher mounts it at /code)")
+            p.add_argument("--no-semgrep", action="store_true")
+        p.set_defaults(fn={"launch": cmd_launch}.get(name, cmd_audit))
+    p = sub.add_parser("watch", help="weekly check: live audit, exit code 3 when real visitors got slower (Cloudflare 7 days)")
+    p.add_argument("url")
+    p.set_defaults(fn=cmd_watch)
     p = sub.add_parser("code", help="code audit of a site folder (mounted at /code, set CODE=<folder>)")
     p.add_argument("path", nargs="?", default="/code")
     p.add_argument("--url", help="live page URL: links speed problems to code lines and checks what is deployed")
@@ -1251,9 +1757,7 @@ def main():
     p = sub.add_parser("learn", help="review Claude's new findings and turn them into rules")
     p.add_argument("--yes", action="store_true", help="accept every finding that passes the checks (no questions)")
     p.set_defaults(fn=cmd_learn)
-    p = sub.add_parser("rules", help="list rules, mark a false alarm, export/import for the team")
-    p.add_argument("action", nargs="?", default="list", choices=["list", "false-alarm", "export", "import"])
-    p.add_argument("rule", nargs="?", help="rule id (false-alarm) or zip file name in reports/ (import)")
+    p = sub.add_parser("rules", help="list rules: how often each fired or was silenced with 'lp-audit: ok'")
     p.set_defaults(fn=cmd_rules)
     p = sub.add_parser("history", help="past audits for a domain")
     p.add_argument("domain")

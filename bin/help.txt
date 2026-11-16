@@ -6,37 +6,55 @@ how to check the fix. Rules decide what is broken; AI only writes the summary.
 
 USE IT IN THIS ORDER FOR EVERY LANDING PAGE
 
-  Before launch
-    1. lp-audit code <site folder> --url <page url>   check the code (30 s)
-    2. Run the Claude command printed at the end of the report (one pass)
-    3. lp-audit learn                                  turn Claude's new findings into rules
-    4. lp-audit prelaunch <page url>                   speed test + GTmetrix once (4 min)
-       Fix the problems, run 1 and 4 again until they pass.
+  Before launch (one command)
+    lp-audit launch <page url> --code <site folder>
+       Code check + speed test + form and tracking test. Ends with READY or NOT READY.
+       Run the Claude command printed at the end of the code report (one pass per site).
+       Fix the problems and run it again until it says READY.
+       Do the last run on the real domain (the Cloudflare cache check only works there).
 
   While ads are running (a few days after start, then every week)
-    5. lp-audit live <page url>                        same tests + real visitors' data
+    lp-audit live <page url>         same tests + real visitors' data
+    lp-audit weekly <page url>       Windows: runs it every Monday, a window opens only if visitors got slower
+
+  Once a month
+    lp-audit learn                   turn Claude's review findings into new rules
 
 COMMANDS
 
+  lp-audit launch <url> --code <folder>
+                                   code check, then prelaunch. READY / NOT READY at the end.
+                                   GTmetrix is skipped while the code has must-fix problems.
+
   lp-audit prelaunch <url>         before launch: lab test x3 (phone + desktop), real-visitor test
-                                   (waits, scrolls, finds what jumps), server backend time, Cloudflare
-                                   cache, ad-click URL (?gclid=...), private files on the server, GTmetrix x1
+                                   (waits, scrolls, finds what jumps, phone screenshots), form and
+                                   tracking test, Google Ads basics, server checks, GTmetrix x1
        --runs 1                    faster (1 run instead of 3)
        --no-gtmetrix               skip GTmetrix (free plan has only 5 tests)
+       --gtmetrix-url <link>       GTmetrix auto-login failed? Run it by hand on gtmetrix.com and
+                                   paste the report link here (uses no test)
        --local-lab                 use this laptop for the lab test (for staging Google cannot open)
+       --submit                    really send the form (test lead "LP Audit Test"). Staging only,
+                                   or tell sales to ignore it. Without it the form is NOT sent.
+       --thank-you <url>           also open the thank-you page and check the Ads conversion fires
 
   lp-audit live <url>              ads running: same tests + Google and Cloudflare real-user data
        --gtmetrix                  also run GTmetrix once
 
+  lp-audit watch <url>             the weekly check: live test, warns only when Cloudflare's 7-day
+                                   data got worse (over target and 20% worse than last time)
+  lp-audit weekly <url>            Windows: run "watch" every Monday 11:00 (Task Scheduler)
+  lp-audit weekly <url> --stop     stop it
+
   lp-audit code [folder]           code audit of a site folder (default: the folder you are in)
        --url <page url>            link speed problems to code lines, check what is uploaded
        --no-semgrep                skip Semgrep (it needs internet)
+                                   False alarm on a line? Add the comment  lp-audit: ok  on that
+                                   line (// lp-audit: ok  or  # lp-audit: ok  or  <!-- lp-audit: ok -->)
 
-  lp-audit learn                   review Claude's findings, add good ones as rules
-  lp-audit rules                   list rules: how often each fired, false alarms
-  lp-audit rules false-alarm <id>  mark a wrong hit
-  lp-audit rules export            zip our rules to share with the team
-  lp-audit rules import <zip>      add the team's rules (put the zip in reports/ first)
+  lp-audit learn                   monthly: review Claude's findings, add good ones as rules.
+                                   Then commit and push code_rules.json so the team gets them.
+  lp-audit rules                   list rules: how often each fired or was silenced
 
   lp-audit history <domain>        past audits of a site
   lp-audit clean <domain>          delete a site's reports

@@ -34,6 +34,22 @@ case "$cmd" in
     need_docker
     abs="$(cd "$dir" && pwd)"
     CODE="$abs" compose run --rm -e CODE_NAME="$(basename "$abs")" audit code /code "$@" ;;
+  launch)
+    # lp-audit launch <url> --code <folder>: the folder is mounted at /code
+    shift; args=(); dir=""
+    while [ $# -gt 0 ]; do
+      if [ "$1" = "--code" ] && [ $# -gt 1 ]; then dir="$2"; args+=(--code /code); shift 2; else args+=("$1"); shift; fi
+    done
+    need_docker
+    if [ -n "$dir" ]; then
+      [ -d "$dir" ] || { echo "Not a folder: $dir" >&2; exit 1; }
+      abs="$(cd "$dir" && pwd)"
+      CODE="$abs" compose run --rm -e CODE_NAME="$(basename "$abs")" audit launch ${args[@]+"${args[@]}"}
+    else
+      compose run --rm audit launch ${args[@]+"${args[@]}"}
+    fi ;;
+  weekly)
+    echo "The weekly check uses Windows Task Scheduler. On a Mac, run it by hand: lp-audit watch <url>" ;;
   *)
     need_docker; compose run --rm audit "$@" ;;
 esac
