@@ -19,7 +19,8 @@ USE IT IN THIS ORDER FOR EVERY LANDING PAGE
 COMMANDS
 
   lp-audit prelaunch <url>         before launch: lab test x3 (phone + desktop), real-visitor test
-                                   (waits, scrolls, finds what jumps), server checks, GTmetrix x1
+                                   (waits, scrolls, finds what jumps), server backend time, Cloudflare
+                                   cache, ad-click URL (?gclid=...), private files on the server, GTmetrix x1
        --runs 1                    faster (1 run instead of 3)
        --no-gtmetrix               skip GTmetrix (free plan has only 5 tests)
        --local-lab                 use this laptop for the lab test (for staging Google cannot open)

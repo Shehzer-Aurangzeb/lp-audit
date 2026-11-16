@@ -83,6 +83,7 @@ def lh_metrics(lhr):
         "tbt_ms": num("total-blocking-time"), "cls": num("cumulative-layout-shift"),
         "si_ms": num("speed-index"),
         "bytes_kb": (num("total-byte-weight") or 0) / 1024 or None,
+        "ttfb_ms": num("server-response-time") or num("document-latency-insight"),
     }
 
 
@@ -186,7 +187,7 @@ def visitor_test(url, device, wait_s=15):
 class _Html(html.parser.HTMLParser):
     def __init__(self):
         super().__init__()
-        self.ext, self.img_no_size, self.classes = set(), 0, set()
+        self.ext, self.img_no_size, self.classes, self.form_token = set(), 0, set(), False
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -196,13 +197,27 @@ class _Html(html.parser.HTMLParser):
             self.ext.add(urllib.parse.urlparse(src if src.startswith("http") else "https:" + src).hostname)
         if tag == "img" and not (a.get("width") and a.get("height")):
             self.img_no_size += 1
+        if tag == "input" and (a.get("type") or "").lower() == "hidden" and re.search(r"csrf|token|nonce", a.get("name") or "", re.I):
+            self.form_token = True
 
 
 def parse_html(text, own_host):
     p = _Html()
     p.feed(text)
     return {"external": sorted(h for h in p.ext if h and h != own_host and not h.endswith("." + own_host)),
-            "img_no_size": p.img_no_size, "classes": sorted(p.classes)}
+            "img_no_size": p.img_no_size, "classes": sorted(p.classes), "form_token": p.form_token}
+
+
+def backend_ms(url):
+    """Server work only, like GTmetrix 'Backend Duration': first byte minus connection setup minus one round trip.
+    Does not depend much on where the laptop is (we talk to the nearest Cloudflare server)."""
+    r = run(["curl", "-s", "-o", "/dev/null", "-A", UA, "--max-time", "30", "-w",
+             "%{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}", url], 40)
+    try:
+        dns, conn, tls, first = map(float, r.stdout.split())
+        return round(max(0, first - tls - (conn - dns)) * 1000)
+    except (AttributeError, ValueError):
+        return None
 
 
 def server_checks(url, tries=3):
@@ -224,6 +239,30 @@ def server_checks(url, tries=3):
                      "cache_control": h.get("cache-control"), "encoding": h.get("content-encoding"),
                      "server": h.get("server"), "powered_by": h.get("x-powered-by")})
     return rows, body
+
+
+AD_PARAMS = {"gclid": "lpaudit{n}", "utm_source": "google", "utm_medium": "cpc", "utm_campaign": "lpaudit"}
+CACHED = {"HIT", "STALE", "REVALIDATED", "UPDATING"}
+
+
+def ad_click_check(url):
+    """Ad clicks arrive as url?gclid=...&utm_...; every click has a new gclid.
+    Two different gclids: if both miss the cache, every real ad visitor waits for the server."""
+    rows = []
+    for n in (1, 2):
+        sep = "&" if "?" in url else "?"
+        test = url + sep + urllib.parse.urlencode({k: v.format(n=n) for k, v in AD_PARAMS.items()})
+        req = urllib.request.Request(test, headers={"User-Agent": UA})
+        t = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                final = r.url
+                rows.append({"cache": r.headers.get("cf-cache-status", "MISSING"), "ttfb_ms": round((time.time() - t) * 1000),
+                             "params_kept": "gclid=" in final, "final_url": final[:200]})
+        except Exception as e:
+            rows.append({"cache": "ERROR", "error": type(e).__name__, "params_kept": None})
+    return {"tries": rows, "cached": any(r["cache"] in CACHED for r in rows),
+            "params_lost": any(r.get("params_kept") is False for r in rows)}
 
 
 def fingerprint_similarity(a, b):
@@ -440,7 +479,8 @@ def render(url, mode, when, facts, failed, lh_top, ai_summary):
         L += ["## Summary", "", ai_summary.strip(), ""]
     L += ["## Results (middle of runs)", "", f"Lab tests: {get(facts, 'lab.source') or '-'}.", "", "| Check | Phone | Desktop | Target |", "| --- | --- | --- | --- |"]
     rows = [("Lighthouse score", "lab.{}.score", "", "90+"), ("LCP (lab)", "lab.{}.lcp_ms", "_ms", "2.5 s"),
-            ("TBT (lab)", "lab.{}.tbt_ms", "_ms", "200 ms"), ("CLS (lab)", "lab.{}.cls", "", "0.1"),
+            ("TBT (lab)", "lab.{}.tbt_ms", "_ms", "200 ms"),
+            ("CLS (lab)", "lab.{}.cls", "", "0.1"),
             ("CLS real visitor (wait + scroll)", "visitor.{}.cls", "", "0.1"),
             ("Blocking time real visitor", "visitor.{}.blocking_ms", "_ms", "300 ms"),
             ("Network quiet after", "visitor.{}.quiet_s", "", "8 s"),
@@ -449,8 +489,14 @@ def render(url, mode, when, facts, failed, lh_top, ai_summary):
         key = path.split(".")[-1]
         L.append(f"| {name} | {fmt(get(facts, path.format('mobile')), key)} | {fmt(get(facts, path.format('desktop')), key)} | {target} |")
     s = facts["server"]
-    L += ["", f"Server: TTFB {fmt(s['ttfb_ms'], '_ms')} (tries: {', '.join(fmt(t, '_ms') for t in s['ttfb_all'])}), "
-          f"Cloudflare cache `{s['cache']}`, compression `{s['encoding']}`.",
+    ad = s.get("ad_click") or {}
+    L += ["", f"Server: backend time {fmt(s.get('backend_ms'), '_ms')} "
+          f"(tries: {', '.join(fmt(t, '_ms') for t in s.get('backend_all') or [])}; server work only, like GTmetrix 'Backend Duration'). "
+          f"Full answer time from this laptop {fmt(s['ttfb_ms'], '_ms')}. Cloudflare cache `{s['cache']}`, compression `{s['encoding']}`."]
+    if ad:
+        L += ["", f"Ad-click URL (?gclid=...&utm_...): cache `{' / '.join(t['cache'] for t in ad['tries'])}`, "
+              f"gclid kept after redirects: {'no' if ad['params_lost'] else 'yes'}."]
+    L += [
           "", "Server checks and the real-visitor test ran from this laptop's internet. "
               "Visitors in other countries can see different server times.", ""]
     gt = facts.get("gtmetrix") or {}
@@ -586,7 +632,15 @@ def cmd_audit(args):
     facts["server"] = {"ttfb_ms": median(r["ttfb_ms"] for r in rows), "ttfb_all": [r["ttfb_ms"] for r in rows],
                        "cache": rows[-1]["cache"], "encoding": rows[-1].get("encoding"), "tries": rows,
                        "max_ttfb_ms": max(r["ttfb_ms"] for r in rows)}
+    backend = [backend_ms(url) for _ in range(3)]
+    facts["server"]["backend_ms"], facts["server"]["backend_all"] = median(backend), backend
     facts["html"] = parse_html(body, host)
+    log("Ad-click URL (gclid + utm) and exposed files")
+    ad = ad_click_check(url)
+    plain_cached = facts["server"]["cache"] in CACHED
+    facts["server"]["ad_click"] = {**ad, "cache_miss": plain_cached and not ad["cached"]}
+    facts["server"]["exposed"] = exposed_files(url)
+    facts["html"]["cached_token"] = facts["html"]["form_token"] and (plain_cached or ad["cached"])
 
     chrome = chrome_path()
     key = google_key() if not args.local_lab else None
@@ -752,13 +806,20 @@ def gitleaks(root):
             for x in res if "/.git/" not in x["File"]][:20]
 
 
-def git_snapshot(root, label):
-    """Local git only (no GitHub): save the exact code version this audit looked at."""
-    g = lambda *a: run(["git", "-C", str(root), *a], 60)
-    if not (root / ".git").exists():
-        g("init", "-q")
-    if not (root / ".gitignore").exists():
-        (root / ".gitignore").write_text(GITIGNORE)
+def snap_dir(name):
+    return DATA / ".snapshots" / f"{slug(name)}.git"
+
+
+def git_snapshot(root, name, label):
+    """Save the exact code version this audit looked at. The git data lives in reports/.snapshots/,
+    never in the site folder, so nothing extra can be uploaded to the server by mistake."""
+    gd = snap_dir(name)
+    g = lambda *a: run(["git", f"--git-dir={gd}", f"--work-tree={root}", *a], 60)
+    if not gd.exists():
+        gd.parent.mkdir(parents=True, exist_ok=True)
+        run(["git", "init", "-q", "--bare", str(gd)], 60)
+        (gd / "info").mkdir(exist_ok=True)
+        (gd / "info" / "exclude").write_text(GITIGNORE + ".git/\n")
     g("add", "-A")
     st = g("status", "--porcelain")
     if st and st.stdout.strip():
@@ -767,9 +828,27 @@ def git_snapshot(root, label):
     return head.stdout.strip() if head and head.returncode == 0 else None
 
 
-def changed_since(root, commit):
-    r = run(["git", "-C", str(root), "diff", "--name-only", f"{commit}..HEAD"], 60) if commit else None
+def changed_since(name, commit):
+    r = run(["git", f"--git-dir={snap_dir(name)}", "diff", "--name-only", f"{commit}..HEAD"], 60) if commit else None
     return [l for l in r.stdout.splitlines() if l] if r and r.returncode == 0 else None
+
+
+def exposed_files(url):
+    """Files that must never be downloadable from the live site (.git, .env, backups)."""
+    u = urllib.parse.urlparse(url)
+    bases = dict.fromkeys([f"{u.scheme}://{u.netloc}/", urllib.parse.urljoin(url, "./")])
+    found = []
+    for base in bases:
+        for path, looks_real in ((".git/HEAD", lambda t: t.startswith("ref:")), (".env", lambda t: "=" in t and "<html" not in t.lower()),
+                                 ("backup.sql", lambda t: "create table" in t.lower() or "insert into" in t.lower())):
+            try:
+                req = urllib.request.Request(base + path, headers={"User-Agent": UA})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    if r.status == 200 and looks_real(r.read(2000).decode("utf-8", "replace")):
+                        found.append(base + path)
+            except Exception:
+                pass
+    return found
 
 
 def speed_links(root, host):
@@ -852,8 +931,8 @@ def cmd_code(args):
     last_commit = json.loads(last[0]).get("commit") if last else None
 
     log("Saving code version (local git)")
-    commit = git_snapshot(root, f"audit {now:%Y-%m-%d %H:%M} code")
-    changed = changed_since(root, last_commit)
+    commit = git_snapshot(root, name, f"audit {now:%Y-%m-%d %H:%M} code")
+    changed = changed_since(name, last_commit)
 
     rules = json.loads(CODE_RULES.read_text())
     log("Our rules (leftovers, security basics)")
@@ -870,11 +949,14 @@ def cmd_code(args):
     tools += gitleaks(root)
     links = speed_links(root, host) if host else []
     deploy = deploy_check(root, args.url) if args.url else []
+    exposed = exposed_files(args.url) if args.url else []
     if links:
         log(f"Linked {len(links)} speed problem(s) to code lines")
 
     by_rule = {r["id"]: r for r in rules}
     problems = [{**by_rule[h["rule"]], "evidence": f"{h['file']}:{h['line']}"} for h in hits]
+    problems += [{"title": "Private file downloadable from the live site", "fix": "Delete it from the server and change the passwords inside.",
+                  "severity": 1, "evidence": e} for e in exposed]
     problems += [{"title": f"{t['tool']}: {t['message']}", "fix": "See the file and line.", "severity": 1 if t["tool"] in ("php -l", "gitleaks") else 2,
                   "evidence": f"{t['file']}:{t['line']}"} for t in tools]
     problems.sort(key=lambda p: p.get("severity", 3))
@@ -894,6 +976,10 @@ def cmd_code(args):
         L += [f"- **{l['problem']}**: `{l['file']}:{l['line']}` `{l['code']}`" for l in links] + [""]
     if deploy:
         L += ["## Live site vs your folder", ""] + [f"- `{d['file']}`: {d['status']}" for d in deploy] + [""]
+    if exposed:
+        L += ["## Private files can be downloaded from the live site", "",
+              "Delete them from the server now. If .env or .git was public, change the passwords inside.", ""]
+        L += [f"- {e}" for e in exposed] + [""]
     if risky:
         L += ["## Files that should not be on the live site", ""] + [f"- `{r}`" for r in risky] + [""]
     L += ["## Our rules", ""]
@@ -909,7 +995,7 @@ def cmd_code(args):
     checks = json.loads(CHECKLIST.read_text()) if CHECKLIST.exists() else []
     if checks:
         L += ["## Manual checks (learned from past reviews)", ""] + [f"- [ ] {x['title']}: {x.get('why') or ''}" for x in checks] + [""]
-    L += ["## Before upload", "", "Do not upload the `.git` folder, `.env` or backup files to the server.", "",
+    L += ["## Before upload", "", "Do not upload `.env`, backup files (.bak, .sql, .zip) or a `.git` folder to the server.", "",
           "## Claude Code review (one pass)", "",
           "In the site folder, run:", "", "```",
           f'claude "Follow the instructions in {os.environ.get("LP_AUDIT_DIR", ".")}/reports/{folder_rel}/claude_prompt.md"',
@@ -917,7 +1003,7 @@ def cmd_code(args):
     (folder / "report.md").write_text("\n".join(L))
     summary = {"commit": commit, "rules": len(hits), "tools": len(tools), "risky": len(risky), "links": len(links)}
     (folder / "summary.json").write_text(json.dumps({"name": name, "path": str(root), "commit": commit, "hits": hits,
-                                                     "tools": tools, "risky": risky, "links": links, "deploy": deploy}, indent=1))
+                                                     "tools": tools, "risky": risky, "links": links, "deploy": deploy, "exposed": exposed}, indent=1))
     rule_stats(c, {h["rule"] for h in hits})
     c.execute("INSERT INTO runs (domain, url, mode, ts, folder, version, classes, summary) VALUES (?,?,?,?,?,?,?,?)",
               (name, args.url, "code", now.isoformat(), folder_rel, 1, "[]", json.dumps(summary)))
@@ -1090,6 +1176,15 @@ def demo():
     facts.update({"html": {"external": [], "img_no_size": 0}, "server": {**facts["server"], "ttfb_all": [300], "encoding": "gzip"}})
     md = render("https://x.com/", "prelaunch", "now", facts, evaluate(json.loads(RULES.read_text()), facts), [], None)
     assert "Chat widget moves the page" in md and "chat-widget-container" in md
+    # fixes 1-4: form token in cached HTML, ad-click cache miss, lost gclid, exposed files, lab TTFB
+    assert parse_html('<form><input type="hidden" name="csrf_token" value="x"></form>', "x.com")["form_token"]
+    f2 = {"server": {"ad_click": {"cache_miss": True, "params_lost": True}, "exposed": ["https://x.com/.git/HEAD"]},
+          "html": {"cached_token": True}, "lab": {}}; f2["server"]["backend_ms"] = 900
+    ids2 = {r["id"] for r in evaluate(json.loads(RULES.read_text()), f2)}
+    assert {"ad-click-cache-miss", "ad-click-params-lost", "exposed-files", "cached-form-token", "server-ttfb"} <= ids2, ids2
+    f2["server"] = {"ad_click": {"cache_miss": False, "params_lost": False}, "exposed": []}
+    f2["html"]["cached_token"], f2["server"]["backend_ms"] = False, 150
+    assert not {r["id"] for r in evaluate(json.loads(RULES.read_text()), f2)}
     # real-user data (shapes from the CrUX API docs; Cloudflare shape = our query)
     g = crux_parse({"record": {"metrics": {"largest_contentful_paint": {"percentiles": {"p75": 2900}},
                                            "cumulative_layout_shift": {"percentiles": {"p75": "0.25"}}}}})

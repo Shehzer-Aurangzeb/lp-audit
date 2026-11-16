@@ -32,9 +32,9 @@ Reports: `reports/<domain>/<date>_<mode>/report.md` in this folder (`lp-audit op
 
 | Command | Checks |
 | --- | --- |
-| `prelaunch` | Lighthouse 3x on phone and desktop (on Google's servers in the USA when `GOOGLE_API_KEY` is set), real-visitor test (waits 15 s, scrolls, finds what jumps and what keeps loading), server checks (Cloudflare cache, response time), GTmetrix 1x |
+| `prelaunch` | Lighthouse 3x on phone and desktop (on Google's servers in the USA when `GOOGLE_API_KEY` is set), real-visitor test (waits 15 s, scrolls, finds what jumps and what keeps loading), server checks (backend time, Cloudflare cache, the ad-click URL with `?gclid=` and `utm_`, private files like `.git` or `.env` downloadable from the server), GTmetrix 1x |
 | `live` | Same as prelaunch (GTmetrix only with `--gtmetrix`), plus real users: Google Chrome data (28 days) and Cloudflare Web Analytics (7 days) |
-| `code` | Our rules (`code_rules.json`: debug output, passwords in code, SQL injection, unescaped input, forms without CSRF token, test content...), php -l, PHPStan, Semgrep, gitleaks, files that must not be uploaded. With `--url`: speed problems linked to the exact code line, and live CSS/JS compared with your folder. Saves the code version with local git (nothing leaves the laptop) |
+| `code` | Our rules (`code_rules.json`: debug output, passwords in code, SQL injection, unescaped input, forms without CSRF token, test content...), php -l, PHPStan, Semgrep, gitleaks, files that must not be uploaded. With `--url`: speed problems linked to the exact code line, and live CSS/JS compared with your folder. Saves the code version with git in `reports/.snapshots/` (never inside the site folder, nothing leaves the laptop) |
 | `learn` | Checks each rule Claude proposes (catches its bad example, not the fixed one, not a duplicate, not too many hits) and adds the ones you approve |
 | `rules` | How often each rule fired, false alarms, export/import to share rules with the team |
 
@@ -55,5 +55,5 @@ Try the code check on the demo site with planted mistakes: `lp-audit code sample
 
 - GTmetrix free plan: 5 tests per account, one account per person. The tool runs it once per launch and skips it when no tests are left.
 - Google real-user data needs enough Chrome visitors. New pages show whole-site data first.
-- Server times are measured from your laptop. Visitors in the USA see different times.
+- Backend time is server work only (like GTmetrix 'Backend Duration'), so it does not depend much on where you test from.
 - Raw test data is deleted after 30 days. Reports stay. About 3-5 MB per audit.
