@@ -76,7 +76,7 @@ Check: it ends with **demo ok**.
    lp-audit code $HOME\lp-audit\samples\demo-site
    ```
    Open the report (`lp-audit open`). It should find about 18 problems.
-2. Speed check on a real page:
+2. Speed check on one of our live landing pages (I will send you the URL):
    ```
    lp-audit prelaunch https://your-landing-page-url/ --runs 1 --no-gtmetrix
    ```
