@@ -14,5 +14,6 @@ services:
       - ./rules.json:/app/rules.json:ro
       - ./code_rules.json:/app/code_rules.json          # 'audit learn' adds rules here
       - ./manual_checklist.json:/app/manual_checklist.json
+      - ./accepted.json:/app/accepted.json              # 'audit accept' writes here (shared in Git)
       - ./samples:/app/samples:ro
       - ${CODE:-./samples/demo-site}:/code   # the site folder for 'audit code' (set CODE=...)

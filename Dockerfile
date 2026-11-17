@@ -16,5 +16,5 @@ RUN A=$([ "$TARGETARCH" = "arm64" ] && echo arm64 || echo x64) \
  && git config --system --add safe.directory '*'
 
 WORKDIR /app
-COPY audit.py rules.json code_rules.json manual_checklist.json ./
+COPY audit.py rules.json code_rules.json manual_checklist.json accepted.json ./
 ENTRYPOINT ["python3", "/app/audit.py"]

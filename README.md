@@ -26,6 +26,10 @@ lp-audit weekly https://the-page-url/     # Windows: every Monday; a window open
 
 Once a month: `lp-audit learn` turns Claude's findings into rules. Commit and push `code_rules.json` and `manual_checklist.json`; the others get them with `lp-audit update`.
 
+**Keeping a problem on purpose:** not every fix is worth it (sales may need the chat widget). Each problem in a report shows its id, for example `chat-widget-shift`. Run `lp-audit accept https://the-page-url/ chat-widget-shift --why "sales needs chat"`: the problem moves to "Accepted, not fixed" in every report and the share summary, and no longer makes the page NOT READY. It is per page, and new problems still count. Commit and push `accepted.json` so the team sees it. A false alarm on one code line is different: put the comment `lp-audit: ok` on that line.
+
+Each landing page has its own history: "since the last audit" and "changed since the last code audit" compare with the last run of the same page, not just the same domain.
+
 **For the team chat:** every `launch`, `prelaunch` and `live` also makes a dated folder `reports/share/<date> <site> <page> <mode>/` (`lp-audit share` opens it): `1 summary.txt` (result in plain words), `2 pagespeed-phone.png`, `3 pagespeed-desktop.png` (from pagespeed.web.dev), `4 gtmetrix.png` (when GTmetrix ran) and `5 phone-after-15-seconds.jpg`. Post these files, not the technical report. The PageSpeed screenshot is one fresh test by Google, so its score can be a little different from the report's middle of 3 tests; the summary gives both.
 
 **When something fails:** the tool never stops silently. A step that did not work is listed under "Steps that did not work" in the report, and the tool prints `Send this file to Shehzar:` with a file in `reports/errors/`. That file has the command, the step, the error and which settings are filled in, but never a key, token or password.

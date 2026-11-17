@@ -56,7 +56,16 @@ COMMANDS
                                    Then commit and push code_rules.json so the team gets them.
   lp-audit rules                   list rules: how often each fired or was silenced
 
-  lp-audit history <domain>        past audits of a site
+  lp-audit accept <url> <id> --why "reason"
+                                   keep one problem on purpose on that page (e.g. sales needs the
+                                   chat widget). It stays listed under "Accepted, not fixed" in every
+                                   report but no longer makes it NOT READY. The id is shown next to
+                                   each problem. Then commit and push accepted.json for the team.
+  lp-audit accept <url>            list what is accepted on that page
+  lp-audit accept <url> <id> --remove
+                                   count it again
+
+  lp-audit history <domain>        past audits of a site (each page separately)
   lp-audit clean <domain>          delete a site's reports
   lp-audit clean --older-than 90   delete reports older than 90 days
   lp-audit open                    open the reports folder

@@ -1018,8 +1018,14 @@ def render(url, mode, when, facts, failed, lh_top, ai_summary, cmp=None):
         ev = "; ".join((f"{x['el']} ({x.get('v', 0):.2f})" if "el" in x else
                         " ".join(str(x[k]) for k in ("status", "kind", "url", "title") if k in x)) if isinstance(x, dict) else str(x)
                        for x in ev) if isinstance(ev, list) else fmt(ev, r.get("metric", ""))
-        L += [f"### {i}. {r['title']}", "", f"**Found:** {ev}", ""] + [f"- {f}" for f in r["fix"]] + \
+        L += [f"### {i}. {r['title']} (`{r['id']}`)", "", f"**Found:** {ev}", ""] + [f"- {f}" for f in r["fix"]] + \
              ["", f"**Check:** {r['check']}", ""]
+    if failed:
+        L += [f"Not fixing one on purpose? `lp-audit accept {url} <id> --why \"reason\"` (the id is next to each title).", ""]
+    if facts.get("accepted"):
+        L += ["## Accepted, not fixed", "", "Kept on purpose. They do not make the page NOT READY. "
+              f"To count one again: `lp-audit accept {url} <id> --remove`.", ""]
+        L += [f"- **{r['title']}** (`{r['id']}`), since {r.get('since')}: {r.get('why')}" for r in facts["accepted"]] + [""]
     shifts = get(facts, "visitor.shifts") or []
     if shifts:
         L += ["## Layout shifts (real visitor)", "", "| Element | Device | Total score | Times | First at |", "| --- | --- | --- | --- | --- |"]
@@ -1063,6 +1069,8 @@ def share_summary(url, mode, when, facts, failed, cmp):
         L += ["", "Main cause: " + "; ".join(n for n, _ in causes.most_common())]
     if must:
         L += ["", "Must fix:"] + [f"- {r['title']}" for r in must]
+    if facts.get("accepted"):
+        L += ["", "Kept on purpose (not fixed):"] + [f"- {r['title']}: {r.get('why')}" for r in facts["accepted"]]
     if cmp:
         L += ["", f"Since the last check: {len(cmp['fixed'])} fixed, {len(cmp['new'])} new."]
     return "\n".join(L) + "\n"
@@ -1124,11 +1132,76 @@ def cmd_clean(args):
     print(f"Deleted {len(rows)} audit(s).")
 
 
+def page_key(url):
+    """One landing page = host + path. Query strings (gclid, utm) and a trailing / do not make a new page."""
+    u = urllib.parse.urlparse(url or "")
+    return f"{(u.hostname or '').lower()}{u.path.rstrip('/')}"
+
+
+def last_run(url, modes):
+    """Latest audit of this same page (not just the same domain) in one of these modes, or None."""
+    host, key = urllib.parse.urlparse(url).hostname, page_key(url)
+    rows = db().execute(f"SELECT ts, folder, url FROM runs WHERE domain = ? AND mode IN ({','.join('?' * len(modes))}) "
+                        "ORDER BY ts DESC", (host, *modes)).fetchall()
+    return next(((ts, folder) for ts, folder, u in rows if page_key(u) == key and (DATA / folder).exists()), None)
+
+
+ACCEPTED = Path(__file__).with_name("accepted.json")   # in Git: the team sees what was kept on purpose, and why
+
+
+def accepted_for(url):
+    """Problems this page keeps on purpose: {rule id: entry}. They do not count toward NOT READY."""
+    try:
+        items = json.loads(ACCEPTED.read_text()) if ACCEPTED.exists() else []
+    except ValueError:
+        warn("accepted.json", "not valid JSON; nothing is accepted until it is fixed")
+        return {}
+    return {x["id"]: x for x in items if x.get("page") == page_key(url)}
+
+
+def split_accepted(failed, acc):
+    """(still counted, accepted) - an accepted problem moves to its own list with the reason."""
+    return [r for r in failed if r["id"] not in acc], [{**r, "why": acc[r["id"]].get("why"), "since": acc[r["id"]].get("date")}
+                                                       for r in failed if r["id"] in acc]
+
+
+def cmd_accept(args):
+    """Keep one problem on one page on purpose (e.g. sales needs the chat widget). Listed, never hidden."""
+    if not args.url.startswith("http"):
+        sys.exit("Use: lp-audit accept https://page-url/ <problem-id> --why \"reason\"")
+    page = page_key(args.url)
+    items = json.loads(ACCEPTED.read_text()) if ACCEPTED.exists() else []
+    mine = [x for x in items if x.get("page") == page]
+    if not args.id:
+        print(f"Accepted problems on {page}:" if mine else f"Nothing accepted on {page}.")
+        for x in mine:
+            print(f"  {x['id']:34} since {x.get('date')}: {x.get('why')}")
+        return
+    if args.remove:
+        if not any(x["id"] == args.id for x in mine):
+            sys.exit(f"{args.id} is not accepted on {page}.")
+        items = [x for x in items if not (x.get("page") == page and x["id"] == args.id)]
+        msg = f"Removed: {args.id} counts again on {page}."
+    else:
+        known = {r["id"]: r["title"] for f in (RULES, CODE_RULES) for r in json.loads(f.read_text())}
+        if args.id not in known:
+            close = [i for i in known if args.id.lower() in i or i in args.id.lower()][:5]
+            sys.exit(f"Unknown problem id: {args.id}. The id is shown next to each problem in the report"
+                     + (f". Did you mean: {', '.join(close)}?" if close else "."))
+        if not (args.why or "").strip():
+            sys.exit("Say why, so the team knows: --why \"sales needs the chat widget\"")
+        items = [x for x in items if not (x.get("page") == page and x["id"] == args.id)]
+        items.append({"page": page, "id": args.id, "title": known[args.id], "why": args.why.strip(), "date": f"{datetime.date.today()}"})
+        msg = f"Accepted on {page}: {known[args.id]}. It is listed in every report but no longer makes it NOT READY."
+    ACCEPTED.write_text("[\n" + ",\n".join("  " + json.dumps(x) for x in sorted(items, key=lambda x: (x["page"], x["id"]))) + "\n]\n")
+    print(msg + "\nShare it with the team: commit and push accepted.json.")
+
+
 def cmd_history(args):
-    for ts, mode, folder, summ in db().execute(
-            "SELECT ts, mode, folder, summary FROM runs WHERE domain = ? ORDER BY ts", (args.domain,)):
+    for ts, mode, folder, summ, url in db().execute(
+            "SELECT ts, mode, folder, summary, url FROM runs WHERE domain = ? ORDER BY url, ts", (args.domain,)):
         s = json.loads(summ)
-        print(f"{ts[:16]}  {mode:9}  phone {s.get('mobile')}  desktop {s.get('desktop')}  "
+        print(f"{ts[:16]}  {urllib.parse.urlparse(url or '').path or '-':30}  {mode:9}  phone {s.get('mobile')}  desktop {s.get('desktop')}  "
               f"failed {s.get('failed')}  {folder}")
 
 
@@ -1233,15 +1306,17 @@ def cmd_audit(args):
             if get(facts["field"], f"{src}{d}.error"):
                 warn(f"Real users: {src.title()}{d.replace('.', ' ')}", get(facts["field"], f"{src}{d}.error"))
 
-    failed = group_causes(evaluate(json.loads(RULES.read_text()), facts), facts)
+    acc = accepted_for(url)
+    failed, facts["accepted"] = split_accepted(evaluate(json.loads(RULES.read_text()), facts), acc)
+    failed = group_causes(failed, facts)
     ai = None if args.no_ai or not failed else (log("Ollama summary") or ollama_summary(failed))
 
     c = db()
-    prev = c.execute("SELECT ts, folder FROM runs WHERE domain = ? AND mode = ? ORDER BY ts DESC LIMIT 1",
-                     (host, mode)).fetchone()
+    prev = last_run(url, (mode,))
     cmp = None
     if prev and (DATA / prev[1] / "summary.json").exists():
-        cmp = {**compare(json.loads((DATA / prev[1] / "summary.json").read_text())["failed"], failed), "when": prev[0][:16].replace("T", " ")}
+        before = [r for r in json.loads((DATA / prev[1] / "summary.json").read_text())["failed"] if r["id"] not in acc]
+        cmp = {**compare(before, failed), "when": prev[0][:16].replace("T", " ")}
 
     when = f"{now:%Y-%m-%d %H:%M}"
     facts["step_problems"] = list(STEP_PROBLEMS)
@@ -1278,7 +1353,8 @@ def cmd_launch(args):
     args.cmd = "prelaunch"
     failed, facts = cmd_audit(args)
     word, speed_must = verdict(failed, "prelaunch")
-    must = [f"code: {p['title']} ({p['evidence']})" for p in code_must] + [f"speed: {r['title']}" for r in speed_must]
+    must = [f"code: {p['title']} ({p['evidence']})" + (f"  [{p['id']}]" if p.get("id") else "") for p in code_must] + \
+           [f"speed: {r['title']}  [{r['id']}]" for r in speed_must]
     if facts.get("share"):  # the group sees one verdict for code + speed
         f = facts["share"] / "1 summary.txt"
         text = f.read_text().replace(f"Result: {word}", "Result: " + ("NOT READY" if must else "READY"), 1)
@@ -1288,6 +1364,7 @@ def cmd_launch(args):
     if must:
         print(f"NOT READY: {len(must)} must-fix problem(s)")
         print("\n".join(f"  - {m}" for m in must[:15]) + ("\n  ... see the reports" if len(must) > 15 else ""))
+        print(f"Keeping one on purpose? lp-audit accept {args.url} <id in [ ]> --why \"reason\"")
     else:
         print(f"READY ({len(problems) + len(failed)} smaller problem(s) in the reports)")
     print("=" * 60)
@@ -1308,9 +1385,8 @@ def got_worse(now, before, min_visits=30):
 
 def cmd_watch(args):
     """Weekly check (Task Scheduler): a live audit, alert only when Cloudflare's real-visitor data got worse."""
-    host = urllib.parse.urlparse(args.url).hostname
-    row = db().execute("SELECT folder FROM runs WHERE domain = ? AND mode = 'live' ORDER BY ts DESC LIMIT 1", (host,)).fetchone()
-    before = json.loads((DATA / row[0] / "summary.json").read_text())["facts"] if row and (DATA / row[0] / "summary.json").exists() else {}
+    row = last_run(args.url, ("live",))
+    before = json.loads((DATA / row[1] / "summary.json").read_text())["facts"] if row and (DATA / row[1] / "summary.json").exists() else {}
     args.__dict__.update(cmd="live", runs=1, no_ai=True, no_share=True, gtmetrix=False, gtmetrix_url=None, local_lab=False, submit=False, thank_you=None)
     _, facts = cmd_audit(args)
     alerts = [f"{d}: {a}" for d in ("phone", "desktop")
@@ -1483,12 +1559,12 @@ def exposed_files(url):
     return found
 
 
-def speed_links(root, host):
-    """Point each speed problem from the latest speed audit to the file and line that causes it."""
-    row = db().execute("SELECT folder FROM runs WHERE domain = ? AND mode != 'code' ORDER BY ts DESC LIMIT 1", (host,)).fetchone()
-    if not row:
+def speed_links(root, url):
+    """Point each speed problem from the latest speed audit of this page to the file and line that causes it."""
+    row = last_run(url, ("prelaunch", "live"))
+    if not row or not (DATA / row[1] / "summary.json").exists():
         return []
-    failed = [r["id"] for r in json.loads((DATA / row[0] / "summary.json").read_text())["failed"]]
+    failed = [r["id"] for r in json.loads((DATA / row[1] / "summary.json").read_text())["failed"]]
     cur = {r["id"]: r for r in json.loads(RULES.read_text())}  # current rules: code_match may be newer than the audit
     rules = [{"id": i, "files": cur[i].get("code_files", r"\.(php|html?|js)$"), "match": cur[i]["code_match"]}
              for i in failed if cur.get(i, {}).get("code_match")]
@@ -1559,12 +1635,15 @@ def cmd_code(args):
     folder = DATA / folder_rel
     folder.mkdir(parents=True, exist_ok=True)
     c = db()
-    last = c.execute("SELECT summary FROM runs WHERE domain = ? AND mode = 'code' ORDER BY ts DESC LIMIT 1", (name,)).fetchone()
+    # one history per landing page: two pages on one domain have their own code versions
+    snap = page_key(args.url) if args.url else name
+    rows = c.execute("SELECT summary, url FROM runs WHERE domain = ? AND mode = 'code' ORDER BY ts DESC", (name,)).fetchall()
+    last = next((r for r in rows if (page_key(r[1]) if r[1] else name) == snap), None)
     last_commit = json.loads(last[0]).get("commit") if last else None
 
     log("Saving code version (local git)")
-    commit = git_snapshot(root, name, f"audit {now:%Y-%m-%d %H:%M} code")
-    changed = changed_since(name, last_commit)
+    commit = git_snapshot(root, snap, f"audit {now:%Y-%m-%d %H:%M} code")
+    changed = changed_since(snap, last_commit)
 
     rules = json.loads(CODE_RULES.read_text())
     log("Our rules (leftovers, security basics)")
@@ -1580,12 +1659,15 @@ def cmd_code(args):
         tools += semgrep(root)
     log("gitleaks (passwords, keys)")
     tools += gitleaks(root)
-    links = speed_links(root, host) if host else []
+    links = speed_links(root, args.url) if args.url else []
     deploy = deploy_check(root, args.url) if args.url else []
     exposed = exposed_files(args.url) if args.url else []
     if links:
         log(f"Linked {len(links)} speed problem(s) to code lines")
 
+    acc = accepted_for(args.url) if args.url else {}
+    kept = [h for h in hits if h["rule"] in acc]
+    hits = [h for h in hits if h["rule"] not in acc]
     by_rule = {r["id"]: r for r in rules}
     problems = [{**by_rule[h["rule"]], "evidence": f"{h['file']}:{h['line']}"} for h in hits]
     problems += [{"title": "Private file downloadable from the live site", "fix": "Delete it from the server and change the passwords inside.",
@@ -1619,10 +1701,14 @@ def cmd_code(args):
     if hits:
         for rid in dict.fromkeys(h["rule"] for h in hits):
             r = by_rule[rid]
-            L += [f"### {r['title']}", "", r["fix"], ""] + \
+            L += [f"### {r['title']} (`{rid}`)", "", r["fix"], ""] + \
                  [f"- `{h['file']}:{h['line']}` `{h['code']}`" for h in hits if h["rule"] == rid] + [""]
     else:
         L += ["Nothing found.", ""]
+    if kept:
+        L += ["## Accepted, not fixed", "", f"Kept on purpose for this page. To count one again: `lp-audit accept {args.url} <id> --remove`.", ""]
+        L += [f"- **{by_rule[i]['title']}** (`{i}`), since {acc[i].get('date')}: {acc[i].get('why')} "
+              f"({sum(h['rule'] == i for h in kept)} line(s))" for i in dict.fromkeys(h["rule"] for h in kept)] + [""]
     L += ["## Tools (php -l, PHPStan, Semgrep, gitleaks)", ""]
     L += [f"- **{t['tool']}** `{t['file']}:{t['line']}` {t['message']}" for t in tools] + [""] if tools else ["Nothing found.", ""]
     checks = json.loads(CHECKLIST.read_text()) if CHECKLIST.exists() else []
@@ -1905,6 +1991,20 @@ def demo():
     t = share_summary("https://x.com/", "prelaunch", "now", {**lc, "lab": {"mobile": {"score": 98, "runs": [1, 2, 3]}, "desktop": {"score": 99}},
                       "pagespeed_web": {"phone": "https://pagespeed.web.dev/analysis/x?form_factor=mobile"}}, failed, None)
     assert "Result: NOT READY" in t and "phone 98, desktop 99" in t and "middle of 3" in t and "Chat widget" in t, t
+    # one page = host + path; accepted problems leave the verdict but stay listed
+    assert page_key("https://X.com/lp/a/?gclid=1") == page_key("https://x.com/lp/a") == "x.com/lp/a" != page_key("https://x.com/lp/b/")
+    still, kept = split_accepted(failed, {"chat-widget-shift": {"why": "sales needs chat", "date": "2026-11-17"}})
+    assert "chat-widget-shift" not in [r["id"] for r in still] and kept[0]["why"] == "sales needs chat"
+    md = render("https://x.com/", "prelaunch", "now", {**lc, "accepted": kept}, group_causes(still, lc), [], None)
+    assert "## Accepted, not fixed" in md and "sales needs chat" in md and "(`visitor-cls`)" in md, md
+    global ACCEPTED
+    saved, ACCEPTED = ACCEPTED, Path(tempfile.mkdtemp()) / "accepted.json"
+    with contextlib.redirect_stdout(io.StringIO()):
+        cmd_accept(argparse.Namespace(url="https://x.com/lp/a/", id="chat-widget-shift", why="sales needs chat", remove=False))
+        assert list(accepted_for("https://x.com/lp/a?gclid=9")) == ["chat-widget-shift"] and accepted_for("https://x.com/lp/b") == {}
+        cmd_accept(argparse.Namespace(url="https://x.com/lp/a/", id="chat-widget-shift", why=None, remove=True))
+    assert accepted_for("https://x.com/lp/a") == {}
+    ACCEPTED = saved
     assert verdict([{"severity": 2}], "live")[0] == "OK" and verdict([{"severity": 1}], "prelaunch")[0] == "NOT READY"
     # weekly alert: only when over the target AND >20% worse, and only with enough visits
     before = {"visits": 200, "lcp_ms": 2400, "inp_ms": 150, "cls": 0.05}
@@ -1958,6 +2058,12 @@ def main():
     p.set_defaults(fn=cmd_learn)
     p = sub.add_parser("rules", help="list rules: how often each fired or was silenced with 'lp-audit: ok'")
     p.set_defaults(fn=cmd_rules)
+    p = sub.add_parser("accept", help="keep a problem on purpose on one page (listed, not counted for NOT READY)")
+    p.add_argument("url", help="the page URL")
+    p.add_argument("id", nargs="?", help="problem id from the report, e.g. chat-widget-shift (none = list)")
+    p.add_argument("--why", help="the reason, shown in every report")
+    p.add_argument("--remove", action="store_true", help="count this problem again")
+    p.set_defaults(fn=cmd_accept)
     p = sub.add_parser("history", help="past audits for a domain")
     p.add_argument("domain")
     p.set_defaults(fn=cmd_history)
