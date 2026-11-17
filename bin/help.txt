@@ -60,6 +60,8 @@ COMMANDS
   lp-audit clean <domain>          delete a site's reports
   lp-audit clean --older-than 90   delete reports older than 90 days
   lp-audit open                    open the reports folder
+  lp-audit share                   open the folder for the team chat (PageSpeed and GTmetrix
+                                   screenshots + a short summary, one dated folder per audit)
 
   lp-audit setup                   first time: create .env, check Docker and Ollama, build
   lp-audit update                  get the latest version (git pull + rebuild)
@@ -67,4 +69,7 @@ COMMANDS
   lp-audit help                    this text
 
 Reports: reports/<domain>/<date>_<mode>/report.md inside the lp-audit folder.
+For the team chat: reports/share/<date> <site> <page> <mode>/ (post these, not the report).
+Something went wrong? The tool says so in red-ish "!!!" lines and saves a file in
+reports/errors/. Send that file to Shehzar. It never contains your keys or passwords.
 Every command also has its own help, e.g.: lp-audit prelaunch --help

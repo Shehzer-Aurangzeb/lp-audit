@@ -4,7 +4,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
 export LP_AUDIT_DIR="$ROOT"
+# Report dates in this laptop's time. POSIX TZ has the sign reversed: UTC-5 is "LOCAL+05:00".
+z="$(date +%z)"; [ "${z:0:1}" = "-" ] && sign="+" || sign="-"
+export LP_TZ="LOCAL${sign}${z:1:2}:${z:3:2}"
 compose() { docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" "$@"; }
+
+fail() {  # Docker or git failed before the tool could start
+  echo; echo "!!! $1 did not work. Take a screenshot of this window and send it to Shehzar." >&2; exit 1
+}
 
 need_docker() {
   docker info >/dev/null 2>&1 || { echo "Docker is not running. Start Docker Desktop and try again." >&2; exit 1; }
@@ -18,13 +25,16 @@ case "$cmd" in
     [ -f "$ROOT/.env" ] || { cp "$ROOT/.env.example" "$ROOT/.env"; echo "Created .env. Open it and fill in your keys: $ROOT/.env"; }
     need_docker
     command -v ollama >/dev/null && echo "Ollama: found" || echo "Ollama: not found. Install it from ollama.com, then: ollama pull qwen2.5:3b"
-    compose build && compose run --rm -T audit ;;
+    compose build || fail "Building the tool"; compose run --rm -T audit || fail "The self-check" ;;
   update)
-    git -C "$ROOT" pull --ff-only && need_docker && compose build && compose run --rm -T audit ;;
+    git -C "$ROOT" pull --ff-only || fail "Getting the new version (git pull)"
+    need_docker; compose build || fail "Building the tool"; compose run --rm -T audit || fail "The self-check" ;;
   build)
-    need_docker; compose build ;;
+    need_docker; compose build || fail "Building the tool" ;;
   test)
     need_docker; compose run --rm -T audit ;;
+  share)
+    mkdir -p "$ROOT/reports/share"; (open "$ROOT/reports/share" 2>/dev/null || xdg-open "$ROOT/reports/share") ;;
   open)
     mkdir -p "$ROOT/reports"; (open "$ROOT/reports" 2>/dev/null || xdg-open "$ROOT/reports") ;;
   code)

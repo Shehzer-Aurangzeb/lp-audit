@@ -9,8 +9,8 @@ Lab tests (Lighthouse), a real-visitor test (Chrome waits, scrolls, records),
 server checks, one GTmetrix run, fixed rules from rules.json, and a short
 report. Ollama only writes the summary; the rules decide what is broken.
 """
-import argparse, concurrent.futures, datetime, gzip, html.parser, json, os, re, shutil, sqlite3
-import statistics, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request, urllib.robotparser
+import argparse, concurrent.futures, contextlib, datetime, gzip, html.parser, json, os, re, shutil, sqlite3
+import hashlib, io, statistics, subprocess, sys, tempfile, time, traceback, urllib.error, urllib.parse, urllib.request, urllib.robotparser
 from collections import Counter
 from pathlib import Path
 
@@ -29,8 +29,59 @@ def median(xs):
     return statistics.median(xs) if xs else None
 
 
+LAST_STEP = ["start"]   # what the tool was doing: named in the error message if it stops
+STEP_PROBLEMS = []      # steps that did not work in this run: shown in the report and saved for Shehzar
+
+
 def log(msg):
+    LAST_STEP[0] = msg
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def warn(step, err):
+    """A step did not work, but the audit goes on. Collected into reports/errors/ at the end."""
+    msg = f"{type(err).__name__}: {str(err).splitlines()[0][:200] if str(err) else ''}" if isinstance(err, BaseException) else str(err)
+    msg = hide_secrets(msg)
+    STEP_PROBLEMS.append({"step": step, "error": msg})
+    print(f"[{time.strftime('%H:%M:%S')}] PROBLEM in {step}: {msg}", flush=True)
+
+
+def host_path(rel):
+    """A path in reports/ as the developer sees it on the laptop (Windows or Mac)."""
+    base = os.environ.get("LP_AUDIT_DIR", ".")
+    sep = "\\" if "\\" in base else "/"
+    return base.rstrip("/\\") + sep + ("reports/" + rel).replace("/", sep)
+
+
+SECRETS = ("GOOGLE_API_KEY", "PSI_API_KEY", "CF_API_TOKEN", "CF_ACCOUNT_ID", "GTMETRIX_EMAIL", "GTMETRIX_PASSWORD")
+
+
+def hide_secrets(text):
+    """Error text is shown on screen and sent to Shehzar: never with a key, token or password in it."""
+    for k in SECRETS:
+        if os.environ.get(k) and len(os.environ[k]) > 3:
+            text = text.replace(os.environ[k], f"<{k}>")
+    return re.sub(r"(key|token|password)=[^&\s'\"]+", r"\1=<hidden>", text, flags=re.I)
+
+
+def save_problems(crash=None):
+    """Write reports/errors/<date>_<command>.txt: everything Shehzar needs to fix it, never a key or password."""
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "check"
+    folder = DATA / "errors"
+    folder.mkdir(parents=True, exist_ok=True)
+    rel = f"errors/{datetime.datetime.now():%Y-%m-%d_%H%M%S}_{cmd}.txt"
+    L = ["lp-audit problem report. Send this file to Shehzar.", "",
+         f"Date: {datetime.datetime.now():%Y-%m-%d %H:%M}",
+         f"Command: lp-audit {' '.join(sys.argv[1:])}",
+         f"Tool version: {hashlib.sha1(Path(__file__).read_bytes()).hexdigest()[:8]}",
+         "Settings in .env: " + ", ".join(f"{k} {'set' if os.environ.get(k) else 'empty'}" for k in SECRETS[:-1] + ("OLLAMA_MODEL",)),
+         f"Last step: {LAST_STEP[0]}", ""]
+    if STEP_PROBLEMS:
+        L += ["Steps that did not work:"] + [f"- {x['step']}: {x['error']}" for x in STEP_PROBLEMS] + [""]
+    if crash:
+        L += ["The tool stopped here:", crash]
+    (DATA / rel).write_text(hide_secrets("\n".join(L)))
+    return host_path(rel)
 
 
 def save_raw(folder, name, obj):
@@ -73,8 +124,48 @@ def psi(url, strategy, key):
         with urllib.request.urlopen(f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?{q}", timeout=180) as r:
             return json.loads(r.read())["lighthouseResult"]
     except Exception as e:
-        log(f"PageSpeed API failed ({e}); using local Lighthouse for this run")
+        warn(f"PageSpeed API ({strategy}), used this laptop's Lighthouse instead", e)
         return None
+
+
+GAUGES_DRAWN_JS = """() => { const g = [...document.querySelectorAll('[class*=gauge__percentage]')]
+    .filter(e => e.getBoundingClientRect().width > 0);   // also the big circle's number (SVG text)
+  return g.length > 0 && g.every(e => /\\d/.test(e.textContent)); }"""
+
+
+def pagespeed_shots(url, out):
+    """Screenshots of pagespeed.web.dev for the team chat: the page people know. This is one fresh run by Google,
+    so its score can differ from our middle-of-3 result (the summary says so)."""
+    from playwright.sync_api import sync_playwright
+    res = {}
+    with sync_playwright() as p:
+        b = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+        # tall window: the whole result is on screen without scrolling, so the score circles draw
+        # (they animate only when visible) and the sticky header stays at the top
+        page = b.new_page(viewport={"width": 1300, "height": 2000}, user_agent=UA)
+        try:
+            page.goto("https://pagespeed.web.dev/analysis?form_factor=mobile&url=" + urllib.parse.quote(url, safe=""), timeout=60000)
+            for tab, name in (("Mobile", "phone"), ("Desktop", "desktop")):
+                if tab == "Desktop":
+                    page.get_by_text("Desktop", exact=True).first.click(timeout=10000)
+                done = page.locator("text=View Treemap >> visible=true").first
+                done.wait_for(timeout=180000)   # Google's test takes 20-60 s
+                ok = page.get_by_text("Ok, Got it.", exact=True)
+                if ok.count() and ok.first.is_visible():
+                    ok.first.click()           # cookie notice covers the score
+                page.evaluate("window.scrollTo(0, 0)")
+                try:  # the big score circle fills in after the small ones: wait until its number shows
+                    page.wait_for_function(GAUGES_DRAWN_JS, timeout=20000)
+                except Exception:
+                    pass   # a half-drawn circle is still a useful screenshot
+                page.wait_for_timeout(8000)    # the big circle's number is drawn last, after its animation
+                box = done.bounding_box()
+                page.screenshot(path=str(out / f"{2 if name == 'phone' else 3} pagespeed-{name}.png"),
+                                clip={"x": 0, "y": 0, "width": 1300, "height": min(2000, box["y"] + box["height"] + 20)})
+                res[name] = page.url.split("?")[0] + f"?form_factor={tab.lower()}"
+        finally:
+            b.close()
+    return res
 
 
 def lh_metrics(lhr):
@@ -181,7 +272,7 @@ def visitor_test(url, device, wait_s=15, shots_dir=None):
                 page.screenshot(path=str(shots_dir / name), type="jpeg", quality=60, scale="css", timeout=10000)
                 shots.append({"at": f"{elapsed() / 1000:.0f} s", "file": f"{shots_dir.name}/{name}"})
             except Exception as e:
-                log(f"Screenshot at {at_s} s failed: {type(e).__name__}")
+                warn(f"Phone screenshot at {at_s} s", e)
 
         page.on("request", lambda r: reqs.append((round(elapsed()), r.url, r.resource_type)))
         page.goto(url, wait_until="commit", timeout=60000)
@@ -232,9 +323,16 @@ TRACKERS = (
     ("Google Ads remarketing", r"googleads\.g\.doubleclick\.net/pagead/viewthroughconversion/|google\.[a-z.]+/pagead/1p-user-list/", True),
     ("GA4", r"google-analytics\.com/(g/)?collect|analytics\.google\.com/g/collect", True),
     ("Meta event", r"facebook\.com/tr[/?]", True),
+    ("Google form data", r"google\.[a-z.]+/(pagead|ccm)/form-data/", True),   # Google tag reads the form: not the form itself
 )
 GOOGLE_TAGS = {"Google Tag Manager", "Google tag (gtag.js)"}
 PHP_ERROR = re.compile(r"(Fatal error|Parse error|Warning|Notice|Deprecated|Uncaught \w+)\s*:.{0,200}?on line \d+", re.S)
+
+
+# off screen, invisible, not reachable with Tab, or inside a hidden box: a field people never fill in
+HONEYPOT_JS = """e => { const r = e.getBoundingClientRect(), s = getComputedStyle(e);
+  return r.width < 2 || r.height < 2 || r.right < 0 || r.bottom < 0 || r.left > innerWidth + 50 || s.opacity === '0'
+    || e.tabIndex < 0 || !!e.closest('[aria-hidden=true]'); }"""
 
 
 def tracker(u):
@@ -315,6 +413,8 @@ def tracking_test(url, submit=False, thank_you=None):
                             continue
                         typ = (el.get_attribute("type") or "text").lower()
                         name = (el.get_attribute("name") or el.get_attribute("id") or "").lower()
+                        if el.evaluate(HONEYPOT_JS) or (re.search(r"honeypot|^hp_|_hp$|website|^url$", name) and not el.get_attribute("required")):
+                            continue                 # a spam trap: filling it makes the server drop the lead
                         if typ in ("submit", "button", "hidden", "image", "reset", "file"):
                             continue
                         if el.evaluate("e => e.tagName") == "SELECT":
@@ -331,9 +431,10 @@ def tracking_test(url, submit=False, thank_you=None):
                 out["invalid"] = form.evaluate("f => [...f.elements].filter(e => e.willValidate && !e.checkValidity()).map(e => e.name || e.type)")
                 phase[0] = "submit"
                 btn = form.locator("button[type=submit], input[type=submit], button:not([type])").first
-                if btn.count():
+                try:  # a chat popup or cookie bar can cover the button: then submit the form directly
                     btn.click(timeout=5000)
-                else:
+                except Exception:
+                    out["click_blocked"] = bool(btn.count())
                     form.evaluate("f => f.requestSubmit()")
                 page.wait_for_timeout(8000)
                 out["sent_to"] = sent[:3]
@@ -374,11 +475,10 @@ def tracking_test(url, submit=False, thank_you=None):
 class _Html(html.parser.HTMLParser):
     def __init__(self):
         super().__init__()
-        self.ext, self.img_no_size, self.classes, self.form_token, self.links = set(), 0, set(), False, {}
+        self.ext, self.img_no_size, self.form_token, self.links = set(), 0, False, {}
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
-        self.classes.update((a.get("class") or "").split())
         ref = a.get("href") if tag == "a" else a.get("src") if tag == "img" else None
         if ref and not ref.startswith(("#", "mailto:", "tel:", "javascript:", "data:", "sms:")):
             self.links.setdefault(ref.strip(), "image" if tag == "img" else "link")
@@ -395,7 +495,7 @@ def parse_html(text, own_host):
     p = _Html()
     p.feed(text)
     return {"external": sorted(h for h in p.ext if h and h != own_host and not h.endswith("." + own_host)),
-            "img_no_size": p.img_no_size, "classes": sorted(p.classes), "form_token": p.form_token,
+            "img_no_size": p.img_no_size, "form_token": p.form_token,
             "links": [[kind, ref] for ref, kind in p.links.items()]}
 
 
@@ -408,8 +508,9 @@ def http_status(u):
             if method == "HEAD" and e.code in (403, 405, 501):  # some servers refuse HEAD: try GET
                 continue
             return e.code
-        except Exception:
-            return None
+        except Exception:  # timeout or dropped connection: GET may still work
+            continue
+    return None
 
 
 def broken_links(url, links, limit=60):
@@ -418,11 +519,14 @@ def broken_links(url, links, limit=60):
     urls = {}
     for kind, ref in links:
         full = urllib.parse.urljoin(url, ref).split("#")[0]
-        if full.startswith("http") and full.rstrip("/") != url.split("#")[0].rstrip("/"):
+        # /cdn-cgi/ links are added by Cloudflare (e.g. email protection) and answer 404 to scripts
+        if full.startswith("http") and full.rstrip("/") != url.split("#")[0].rstrip("/") and "/cdn-cgi/" not in full:
             urls.setdefault(full, kind)
     todo = list(urls.items())[:limit]
-    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
         codes = list(pool.map(lambda kv: http_status(kv[0]), todo))
+    # no answer under parallel load is often the server dropping a burst: ask once more, one at a time
+    codes = [http_status(u) if c is None else c for (u, _), c in zip(todo, codes)]
     return [{"url": u[:150], "kind": k, "status": c or "no answer"} for (u, k), c in zip(todo, codes)
             if c is None or c in (404, 410) or c >= 500]
 
@@ -521,12 +625,6 @@ def ad_click_check(url):
             "params_lost": any(r.get("params_kept") is False for r in rows)}
 
 
-def fingerprint_similarity(a, b):
-    """Jaccard of CSS class names: < 0.5 means a different site on the same domain."""
-    a, b = set(a), set(b)
-    return len(a & b) / len(a | b) if a | b else 1.0
-
-
 # ---------- 4. GTmetrix (one run, dev's own free account) ----------
 
 GT_SCRAPE_JS = r"""async () => {
@@ -559,7 +657,7 @@ GT_MANUAL = ("Run the test by hand on https://gtmetrix.com, then give the report
              "lp-audit prelaunch <url> --gtmetrix-url https://gtmetrix.com/reports/...")
 
 
-def gtmetrix(url, state_file, report_url=None):
+def gtmetrix(url, state_file, report_url=None, shot=None):
     """One GTmetrix run with the dev's free account. With report_url: only read a report the dev ran by hand (uses no test)."""
     email, pw = os.environ.get("GTMETRIX_EMAIL"), os.environ.get("GTMETRIX_PASSWORD")
     if not report_url and not (email and pw):
@@ -574,6 +672,8 @@ def gtmetrix(url, state_file, report_url=None):
             if report_url:
                 page.goto(report_url, timeout=60000)
                 page.wait_for_timeout(3000)
+                if shot:
+                    page.screenshot(path=str(shot))
                 r = page.evaluate(GT_SCRAPE_JS)
                 return r if r.get("perf") else {"error": "Could not read that GTmetrix report. Check the link (it must open without login)."}
             page.goto("https://gtmetrix.com/dashboard/account", timeout=60000)
@@ -594,6 +694,8 @@ def gtmetrix(url, state_file, report_url=None):
             if "job_error" in page.url:
                 return {"error": page.locator(".alert").first.inner_text()[:300]}
             page.wait_for_timeout(3000)
+            if shot:
+                page.screenshot(path=str(shot))   # grade, scores and web vitals: the part people post in the group
             r = page.evaluate(GT_SCRAPE_JS)
             ctx.storage_state(path=str(state_file))
             r["tests_used"] = f"{int(used[1]) + 1} of {used[2]}" if used else None
@@ -872,9 +974,16 @@ def render(url, mode, when, facts, failed, lh_top, ai_summary, cmp=None):
             notes.append("Cloudflare fields available: " + ", ".join(field["cloudflare"]["rum_fields"]))
         L += ["", "; ".join(dict.fromkeys(notes)) + ".", ""] if notes else [""]
     tr = facts.get("tracking")
-    if tr:
+    if tr and tr.get("failed"):
+        L += ["## Form and tracking", "", f"The form and tracking test did not finish ({tr['failed']}). "
+              "Nothing about the form or the conversion was checked: submit one test lead by hand and check "
+              "Google Tag Assistant shows the conversion.", ""]
+    elif tr:
         L += ["## Form and tracking", ""]
         L.append(f"Tags when the page opens: {', '.join(tr['tags_on_load']) or 'none'}.")
+        if tr.get("click_blocked"):
+            L.append("Something covers the Submit button on a phone (a chat popup or banner?), so the test submitted the form directly. "
+                     "Check a real visitor can tap it.")
         if tr.get("form"):
             fired = sorted({f"{h['tag']} {h['detail']}".strip() for h in tr["hits"] if h["phase"] != "load"})
             L.append(f"Form filled with test data ({', '.join(tr.get('filled') or []) or 'no fields'}). "
@@ -925,8 +1034,38 @@ def render(url, mode, when, facts, failed, lh_top, ai_summary, cmp=None):
         L += ["## External files", "", ", ".join(facts["html"]["external"]), ""]
     if lh_top:
         L += ["## Other Lighthouse findings (phone)", ""] + [f"- {x['title']} {x['value']}" for x in lh_top[:8]] + [""]
+    if facts.get("step_problems"):
+        L += ["## Steps that did not work", "", "These checks did not run, so the report may miss problems. "
+              "The details are in reports/errors/: send that file to Shehzar.", ""]
+        L += [f"- {x['step']}: {x['error']}" for x in facts["step_problems"]] + [""]
     L += ["## How to check again", "", "Run the same audit again after the fixes. Compare with this report.", ""]
     return "\n".join(L)
+
+
+def share_summary(url, mode, when, facts, failed, cmp):
+    """Plain text for the team chat: no technical words, no numbers people cannot check on the screenshots."""
+    word, must = verdict(failed, mode)
+    gt, web = facts.get("gtmetrix") or {}, facts.get("pagespeed_web") or {}
+    n = len(get(facts, "lab.mobile.runs") or []) or 1
+    L = [f"Landing page check, {when}", url, "", f"Result: {word}" + (f" ({len(must)} must-fix)" if must else ""), "",
+         f"PageSpeed score (Google, {f'middle of {n} tests' if n > 1 else '1 test'}): "
+         f"phone {fmt(get(facts, 'lab.mobile.score'))}, desktop {fmt(get(facts, 'lab.desktop.score'))}"]
+    if web:
+        L.append("PageSpeed report (one test, its score can be a little different): " + web.get("phone", ""))
+    if gt.get("perf") is not None:
+        L.append(f"GTmetrix: Grade {gt.get('grade')}, performance {gt['perf']}%, structure {gt.get('structure')}%  {gt.get('url') or ''}")
+    cf = get(facts, "field.cloudflare.phone")
+    if cf and cf.get("visits"):
+        L.append(f"Real phone visitors, last 7 days ({cf['visits']} visits): page shows in {fmt(cf.get('lcp_ms'), 'lcp_ms')}, "
+                 f"page jump {fmt(cf.get('cls'))} (good is 0.1 or less)")
+    causes = Counter(r["cause_name"] for r in failed if r.get("cause_name"))
+    if causes:
+        L += ["", "Main cause: " + "; ".join(n for n, _ in causes.most_common())]
+    if must:
+        L += ["", "Must fix:"] + [f"- {r['title']}" for r in must]
+    if cmp:
+        L += ["", f"Since the last check: {len(cmp['fixed'])} fixed, {len(cmp['new'])} new."]
+    return "\n".join(L) + "\n"
 
 
 SPEED_WHY = "in plain words why it hurts visitors who come from ads (slow page, page jumps, they leave)"
@@ -949,7 +1088,7 @@ def ollama_summary(failed, kind="speed problems found on a landing page", why=SP
         with urllib.request.urlopen(req, timeout=600) as r:
             return json.loads(r.read())["response"]
     except Exception as e:
-        log(f"Ollama skipped ({e.__class__.__name__}): is Ollama running with model {model}?")
+        warn(f"Ollama summary (is Ollama running with model {model}?)", e)
         return None
 
 
@@ -986,10 +1125,10 @@ def cmd_clean(args):
 
 
 def cmd_history(args):
-    for ts, mode, version, folder, summ in db().execute(
-            "SELECT ts, mode, version, folder, summary FROM runs WHERE domain = ? ORDER BY ts", (args.domain,)):
+    for ts, mode, folder, summ in db().execute(
+            "SELECT ts, mode, folder, summary FROM runs WHERE domain = ? ORDER BY ts", (args.domain,)):
         s = json.loads(summ)
-        print(f"{ts[:16]}  {mode:9}  site v{version}  phone {s.get('mobile')}  desktop {s.get('desktop')}  "
+        print(f"{ts[:16]}  {mode:9}  phone {s.get('mobile')}  desktop {s.get('desktop')}  "
               f"failed {s.get('failed')}  {folder}")
 
 
@@ -1004,6 +1143,11 @@ def cmd_audit(args):
     folder.mkdir(parents=True, exist_ok=True)
     clean_raw()
     facts = {"lab": {}, "visitor": {}}
+    share = None
+    if not getattr(args, "no_share", False):  # dated folder with what the team posts in the group chat
+        page_name = slug(urllib.parse.urlparse(url).path) or "home"
+        share = DATA / "share" / f"{now:%Y-%m-%d %H%M} {host} {page_name} {mode}"
+        share.mkdir(parents=True, exist_ok=True)
 
     log("Server checks (3 tries)")
     rows, body = server_checks(url)
@@ -1033,6 +1177,8 @@ def cmd_audit(args):
             log(f"Lighthouse {preset} run {i + 1}/{args.runs} ({facts['lab']['source']})")
             first = preset == "mobile" and i == 0  # SEO / best practices / accessibility: once is enough
             lhr = (key and psi(url, preset, key)) or lighthouse(url, preset, chrome, ALL_CATEGORIES if first else ("performance",))
+            if not lhr:
+                warn(f"Lighthouse {preset} run {i + 1}", "no result")
             if lhr:
                 runs.append(lh_metrics(lhr))
                 save_raw(folder, f"lighthouse_{preset}_{i + 1}", lhr)
@@ -1042,6 +1188,13 @@ def cmd_audit(args):
         facts["lab"][preset] = {k: median(r[k] for r in runs) for k in runs[0]} if runs else {}
         facts["lab"][preset]["runs"] = runs
 
+    if share:
+        log("PageSpeed web report screenshots (phone and desktop, for the team chat)")
+        try:
+            facts["pagespeed_web"] = pagespeed_shots(url, share)
+        except Exception as e:
+            warn("PageSpeed screenshots (pagespeed.web.dev)", e)
+
     for device in ("mobile", "desktop"):
         log(f"Real-visitor test ({device}: wait 15 s, scroll, record)")
         try:
@@ -1050,19 +1203,22 @@ def cmd_audit(args):
                 shots.mkdir(exist_ok=True)
             facts["visitor"][device] = visitor_test(url, device, shots_dir=shots)
         except Exception as e:
-            log(f"Visitor test {device} failed: {e}")
+            warn(f"Real-visitor test ({device})", e)
     facts["visitor"]["shifts"] = [{**s, "device": d} for d in ("mobile", "desktop")
                                   for s in get(facts, f"visitor.{d}.shifts") or [] if s["v"] >= 0.001]
 
     log("Form and tracking test (phone)" + (": REAL submit, a test lead is sent" if args.submit else ": dry run, nothing is sent"))
     try:
         facts["tracking"] = tracking_test(url, args.submit, args.thank_you)
-    except Exception as e:
-        log(f"Form test failed: {type(e).__name__}: {str(e)[:200]}")
+    except Exception as e:  # never silent: the report and the verdict must show the form was not tested
+        warn("Form and tracking test", e)
+        facts["tracking"] = {"failed": f"{type(e).__name__}: {str(e).splitlines()[0][:150]}", "not_finished": True}
 
     if args.gtmetrix_url or (mode == "prelaunch" and not args.no_gtmetrix) or (mode == "live" and args.gtmetrix):
         log("GTmetrix: reading your report" if args.gtmetrix_url else "GTmetrix (1 run, your free account)")
-        gt = gtmetrix(url, DATA / ".gtmetrix_state.json", args.gtmetrix_url)
+        gt = gtmetrix(url, DATA / ".gtmetrix_state.json", args.gtmetrix_url, share and share / "4 gtmetrix.png")
+        if gt.get("error"):
+            warn("GTmetrix", gt["error"])
         for k in ("lcp", "tbt", "fcp", "si", "tti"):
             gt[f"{k}_ms"] = to_ms(gt.get(k))
         gt["perf"] = int(gt["perf"]) if gt.get("perf") else None
@@ -1073,33 +1229,40 @@ def cmd_audit(args):
         k = google_key()
         facts["field"] = {"google": crux(url, k) if k else {"skipped": "No GOOGLE_API_KEY in .env"},
                           "cloudflare": cloudflare(url)}
+        for src, d in (("google", ".phone"), ("google", ".desktop"), ("cloudflare", "")):
+            if get(facts["field"], f"{src}{d}.error"):
+                warn(f"Real users: {src.title()}{d.replace('.', ' ')}", get(facts["field"], f"{src}{d}.error"))
 
     failed = group_causes(evaluate(json.loads(RULES.read_text()), facts), facts)
     ai = None if args.no_ai or not failed else (log("Ollama summary") or ollama_summary(failed))
 
-    # site version: a very different page on the same domain starts a new history
     c = db()
-    last = c.execute("SELECT version, classes FROM runs WHERE domain = ? ORDER BY ts DESC LIMIT 1", (host,)).fetchone()
-    version = 1 if not last else last[0] + (fingerprint_similarity(json.loads(last[1]), facts["html"]["classes"]) < 0.5)
-    prev = c.execute("SELECT ts, folder FROM runs WHERE domain = ? AND mode = ? AND version = ? ORDER BY ts DESC LIMIT 1",
-                     (host, mode, version)).fetchone()
+    prev = c.execute("SELECT ts, folder FROM runs WHERE domain = ? AND mode = ? ORDER BY ts DESC LIMIT 1",
+                     (host, mode)).fetchone()
     cmp = None
     if prev and (DATA / prev[1] / "summary.json").exists():
         cmp = {**compare(json.loads((DATA / prev[1] / "summary.json").read_text())["failed"], failed), "when": prev[0][:16].replace("T", " ")}
 
     when = f"{now:%Y-%m-%d %H:%M}"
+    facts["step_problems"] = list(STEP_PROBLEMS)
     report = render(url, mode, when, facts, failed, lh_top, ai, cmp)
-    if last and version != last[0]:
-        report = report.replace("\n\n", f"\n\nNew site version (v{version}) on this domain: history starts fresh.\n\n", 1)
     (folder / "report.md").write_text(report)
     summary = {"mobile": get(facts, "lab.mobile.score"), "desktop": get(facts, "lab.desktop.score"),
                "failed": [r["id"] for r in failed]}
-    (folder / "summary.json").write_text(json.dumps({"url": url, "mode": mode, "when": when, "version": version,
+    (folder / "summary.json").write_text(json.dumps({"url": url, "mode": mode, "when": when,
                                                      "facts": facts, "failed": failed}, indent=1, default=str))
     c.execute("INSERT INTO runs (domain, url, mode, ts, folder, version, classes, summary) VALUES (?,?,?,?,?,?,?,?)",
-              (host, url, mode, now.isoformat(), folder_rel, version, json.dumps(facts["html"]["classes"]), json.dumps(summary)))
+              (host, url, mode, now.isoformat(), folder_rel, 1, "[]", json.dumps(summary)))
     c.commit()
+    if share:
+        shot = folder / "screens" / "mobile_15s.jpg"
+        if shot.exists():
+            shutil.copy(shot, share / "5 phone-after-15-seconds.jpg")
+        (share / "1 summary.txt").write_text(share_summary(url, mode, when, facts, failed, cmp))
+        facts["share"] = share
     log(f"Done. Report: reports/{folder_rel}/report.md")
+    if share:
+        print(f"For the team chat: {host_path(share.relative_to(DATA).as_posix())}")
     print(f"\nSpeed check: {verdict(failed, mode)[0]} · Phone {summary['mobile']} · Desktop {summary['desktop']} · {len(failed)} problem(s): "
           + ", ".join(r["title"] for r in failed))
     return failed, facts
@@ -1113,9 +1276,14 @@ def cmd_launch(args):
         log("The code has must-fix problems: GTmetrix skipped to save a free test. Fix them, then run launch again.")
         args.no_gtmetrix = True
     args.cmd = "prelaunch"
-    failed, _ = cmd_audit(args)
+    failed, facts = cmd_audit(args)
     word, speed_must = verdict(failed, "prelaunch")
     must = [f"code: {p['title']} ({p['evidence']})" for p in code_must] + [f"speed: {r['title']}" for r in speed_must]
+    if facts.get("share"):  # the group sees one verdict for code + speed
+        f = facts["share"] / "1 summary.txt"
+        text = f.read_text().replace(f"Result: {word}", "Result: " + ("NOT READY" if must else "READY"), 1)
+        text += "\nCode check: " + (f"{len(code_must)} must-fix problem(s) in the code." if code_must else "no must-fix problems.") + "\n"
+        f.write_text(text)
     print("\n" + "=" * 60)
     if must:
         print(f"NOT READY: {len(must)} must-fix problem(s)")
@@ -1143,7 +1311,7 @@ def cmd_watch(args):
     host = urllib.parse.urlparse(args.url).hostname
     row = db().execute("SELECT folder FROM runs WHERE domain = ? AND mode = 'live' ORDER BY ts DESC LIMIT 1", (host,)).fetchone()
     before = json.loads((DATA / row[0] / "summary.json").read_text())["facts"] if row and (DATA / row[0] / "summary.json").exists() else {}
-    args.__dict__.update(cmd="live", runs=1, no_ai=True, gtmetrix=False, gtmetrix_url=None, local_lab=False, submit=False, thank_you=None)
+    args.__dict__.update(cmd="live", runs=1, no_ai=True, no_share=True, gtmetrix=False, gtmetrix_url=None, local_lab=False, submit=False, thank_you=None)
     _, facts = cmd_audit(args)
     alerts = [f"{d}: {a}" for d in ("phone", "desktop")
               for a in got_worse(get(facts, f"field.cloudflare.{d}"), get(before, f"field.cloudflare.{d}"))]
@@ -1207,7 +1375,7 @@ def run(cmd, timeout=300):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
-        log(f"{cmd[0]} skipped: {e}")
+        warn(f"{cmd[0]} (did not run)", e)
         return None
 
 
@@ -1229,6 +1397,8 @@ def phpstan(root):
     try:
         files = json.loads(r.stdout)["files"]
     except (AttributeError, ValueError, KeyError, TypeError):
+        if r:
+            warn("PHPStan", (r.stderr or r.stdout or "no output").strip()[:200])
         return []
     return [{"tool": "PHPStan", "file": Path(f).relative_to(root).as_posix() if f.startswith(str(root)) else f,
              "line": m.get("line") or 0, "message": m["message"]} for f, v in files.items() for m in v["messages"]][:40]
@@ -1242,9 +1412,14 @@ def semgrep(root):
         cfg += ["--config", str(learned)]
     r = run(["semgrep", "scan", *cfg, "--json", "--metrics=off", "--quiet", "--exclude", "vendor", str(root)], 600)
     try:
-        res = json.loads(r.stdout)["results"]
+        data = json.loads(r.stdout)
+        res = data["results"]
     except (AttributeError, ValueError, KeyError, TypeError):
+        if r:
+            warn("Semgrep (needs internet)", (r.stderr or r.stdout or "no output").strip()[:200])
         return []
+    if not res and data.get("errors"):
+        warn("Semgrep (needs internet)", str(data["errors"][0].get("message", data["errors"][0]))[:200])
     return [{"tool": "Semgrep", "file": Path(x["path"]).relative_to(root).as_posix() if x["path"].startswith(str(root)) else x["path"],
              "line": x["start"]["line"], "message": x["extra"]["message"].strip().split("\n")[0][:200],
              "rule": x["check_id"].split(".")[-1], "severity": x["extra"].get("severity")} for x in res][:40]
@@ -1453,6 +1628,10 @@ def cmd_code(args):
     checks = json.loads(CHECKLIST.read_text()) if CHECKLIST.exists() else []
     if checks:
         L += ["## Manual checks (learned from past reviews)", ""] + [f"- [ ] {x['title']}: {x.get('why') or ''}" for x in checks] + [""]
+    if STEP_PROBLEMS:
+        L += ["## Steps that did not work", "", "These checks did not run, so the report may miss problems. "
+              "The details are in reports/errors/: send that file to Shehzar.", ""]
+        L += [f"- {x['step']}: {x['error']}" for x in STEP_PROBLEMS] + [""]
     L += ["## Before upload", "", "Do not upload `.env`, backup files (.bak, .sql, .zip) or a `.git` folder to the server.", "",
           "## Claude Code review (one pass)", "",
           "In the site folder, run:", "", "```",
@@ -1604,8 +1783,7 @@ def demo():
     assert cls_windows([]) == 0
     h = parse_html('<link href="https://fonts.googleapis.com/x"><img src="/a.png"><img src="b" width=1 height=2>'
                    '<script src="//cdn.jsdelivr.net/x.js"></script><img src="https://cdn.site.com/a"><div class="a b">', "site.com")
-    assert h["external"] == ["cdn.jsdelivr.net", "fonts.googleapis.com"] and h["img_no_size"] == 2 and h["classes"] == ["a", "b"]
-    assert fingerprint_similarity(["a", "b"], ["a", "b"]) == 1 and fingerprint_similarity(["a"], ["z"]) == 0
+    assert h["external"] == ["cdn.jsdelivr.net", "fonts.googleapis.com"] and h["img_no_size"] == 2
     assert to_ms("1.9s") == 1900 and to_ms("378ms") == 378 and to_ms(None) is None
     facts = {"visitor": {"mobile": {"cls": .23}, "shifts": [{"el": "div#chat-widget-container", "v": .12}]},
              "server": {"cache": "DYNAMIC", "ttfb_ms": 300}, "html": {"external": ["fonts.gstatic.com"]},
@@ -1693,6 +1871,23 @@ def demo():
                        "meta_no_pageview": False, "errors": []}}
     ids = {r["id"] for r in evaluate(json.loads(RULES.read_text()), tr)}
     assert ids == {"tracking-conversion-on-load"}, ids
+    crashed = {"tracking": {"failed": "TimeoutError: click", "not_finished": True}}
+    assert {r["id"] for r in evaluate(json.loads(RULES.read_text()), crashed)} == {"form-test-failed"}
+    base = {"visitor": {}, "lab": {}, "html": {"external": [], "img_no_size": 0},
+            "server": {"cache": "HIT", "backend_ms": 1, "ttfb_ms": 1, "encoding": "gzip", "ttfb_all": [1]}}
+    assert "did not finish" in render("https://x.com/", "prelaunch", "now", {**base, **crashed}, [], [], None)
+    assert broken_links("https://x.com/", [["link", "/cdn-cgi/l/email-protection"]]) == []
+    assert tracker("https://www.google.com/pagead/form-data/170?gtm=1") == ("Google form data", True)
+    # problem file: clear, and never a key or password in it
+    os.environ.update(GOOGLE_API_KEY="AIzaSECRET123", LP_AUDIT_DIR="C:\\Users\\taha\\lp-audit")
+    assert host_path("errors/a.txt") == "C:\\Users\\taha\\lp-audit\\reports\\errors\\a.txt"
+    with contextlib.redirect_stdout(io.StringIO()):  # a test problem must not show up in 'lp-audit test'
+        warn("PageSpeed API (mobile)", ValueError("bad answer for key=AIzaSECRET123"))
+    saved = DATA / "errors" / Path(save_problems("Traceback: url?key=AIzaSECRET123&x=1").replace("\\", "/")).name
+    text = saved.read_text()
+    assert "AIzaSECRET123" not in text and "PageSpeed API (mobile)" in text and "GOOGLE_API_KEY set" in text, text
+    saved.unlink()
+    STEP_PROBLEMS.clear()
     # report: grouped by cause (the real LiveChat page: jump + late scripts = one cause), summary, compare
     lc = {"visitor": {"shifts": [{"el": "body > div#chat-widget-container", "v": .7}],
                       "mobile": {"cls": .7, "blocking_ms": 800, "late_requests": [{"url": "https://cdn.livechatinc.com/a.js"}]},
@@ -1706,6 +1901,10 @@ def demo():
     assert cmp["fixed"] == ["Gone"] and "Cache" not in cmp["new"] and len(cmp["still"]) == 1
     md = render("https://x.com/", "prelaunch", "now", lc, failed, [], None, cmp)
     assert "**NOT READY**" in md and "Chat widget (5 problems)" in md and "1 fixed" in md and "One cause, 5 problems" in md, md
+    # summary for the team chat
+    t = share_summary("https://x.com/", "prelaunch", "now", {**lc, "lab": {"mobile": {"score": 98, "runs": [1, 2, 3]}, "desktop": {"score": 99}},
+                      "pagespeed_web": {"phone": "https://pagespeed.web.dev/analysis/x?form_factor=mobile"}}, failed, None)
+    assert "Result: NOT READY" in t and "phone 98, desktop 99" in t and "middle of 3" in t and "Chat widget" in t, t
     assert verdict([{"severity": 2}], "live")[0] == "OK" and verdict([{"severity": 1}], "prelaunch")[0] == "NOT READY"
     # weekly alert: only when over the target AND >20% worse, and only with enough visits
     before = {"visits": 200, "lcp_ms": 2400, "inp_ms": 150, "cls": 0.05}
@@ -1769,7 +1968,29 @@ def main():
     args = ap.parse_args()
     if args.cmd == "clean" and not (args.domain or args.older_than):
         ap.error("clean needs a domain or --older-than DAYS")
-    args.fn(args)
+    crash = None
+    try:
+        args.fn(args)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        sys.exit(130)
+    except Exception as e:
+        crash = (f"{type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''}", traceback.format_exc())
+    finally:  # runs for every ending, also NOT READY (exit 1): problems are never lost
+        if crash or STEP_PROBLEMS:
+            try:
+                path = save_problems(crash and crash[1])
+            except Exception as e:  # even saving failed (disk full?): still say what happened
+                path = f"(could not save the file: {e})"
+            print("\n" + "!" * 60)
+            if crash:
+                print(f"lp-audit STOPPED with an error while: {LAST_STEP[0]}\nError: {hide_secrets(crash[0])}")
+            else:
+                print(f"{len(STEP_PROBLEMS)} step(s) did not work: " + "; ".join(x["step"] for x in STEP_PROBLEMS[:5]))
+            print(f"Send this file to Shehzar: {path}")
+            print("!" * 60)
+    if crash:
+        sys.exit(70)
 
 
 if __name__ == "__main__":

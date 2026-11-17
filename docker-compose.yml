@@ -8,6 +8,7 @@ services:
       - "host.docker.internal:host-gateway"   # reach Ollama on the laptop
     environment:
       LP_AUDIT_DIR: ${LP_AUDIT_DIR:-.}   # set by bin/lp-audit: reports show paths you can open on your laptop
+      TZ: ${LP_TZ:-UTC}                  # set by bin/lp-audit: report dates in the laptop's time, not UTC
     volumes:
       - ./reports:/data/reports
       - ./rules.json:/app/rules.json:ro

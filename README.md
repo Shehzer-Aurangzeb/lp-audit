@@ -26,6 +26,10 @@ lp-audit weekly https://the-page-url/     # Windows: every Monday; a window open
 
 Once a month: `lp-audit learn` turns Claude's findings into rules. Commit and push `code_rules.json` and `manual_checklist.json`; the others get them with `lp-audit update`.
 
+**For the team chat:** every `launch`, `prelaunch` and `live` also makes a dated folder `reports/share/<date> <site> <page> <mode>/` (`lp-audit share` opens it): `1 summary.txt` (result in plain words), `2 pagespeed-phone.png`, `3 pagespeed-desktop.png` (from pagespeed.web.dev), `4 gtmetrix.png` (when GTmetrix ran) and `5 phone-after-15-seconds.jpg`. Post these files, not the technical report. The PageSpeed screenshot is one fresh test by Google, so its score can be a little different from the report's middle of 3 tests; the summary gives both.
+
+**When something fails:** the tool never stops silently. A step that did not work is listed under "Steps that did not work" in the report, and the tool prints `Send this file to Shehzar:` with a file in `reports/errors/`. That file has the command, the step, the error and which settings are filled in, but never a key, token or password.
+
 Reports: `reports/<domain>/<date>_<mode>/report.md` in this folder (`lp-audit open` opens it). Each report starts with **In short**: the verdict, the main cause, and what changed since the last audit (fixed / new / still failing). Problems with one cause are shown together: on our first real page, 8 of 11 problems were the same chat widget.
 
 ## What each check does

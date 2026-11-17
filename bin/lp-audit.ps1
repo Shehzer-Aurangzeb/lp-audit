@@ -2,7 +2,20 @@
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $env:LP_AUDIT_DIR = $Root
+# Report dates in this laptop's time. POSIX TZ has the sign reversed: UTC+5 is "LOCAL-05:00".
+$off = [System.TimeZoneInfo]::Local.GetUtcOffset([DateTime]::Now)
+$env:LP_TZ = "LOCAL" + $(if ($off -lt [TimeSpan]::Zero) { "+" } else { "-" }) + $off.Duration().ToString("hh\:mm")
 $Compose = @("compose", "--project-directory", $Root, "-f", (Join-Path $Root "docker-compose.yml"))
+
+function Check-Step($what) {
+    # Docker or git failed before the tool could start: say it plainly, so the developer can send it to Shehzar
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Host "!!! $what did not work (code $LASTEXITCODE)." -ForegroundColor Red
+        Write-Host "!!! Take a screenshot of this window and send it to Shehzar." -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+}
 
 function Need-Docker {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
@@ -26,11 +39,13 @@ switch ($cmd) {
         Need-Docker
         if (Get-Command ollama -ErrorAction SilentlyContinue) { Write-Host "Ollama: found" }
         else { Write-Host "Ollama: not found. Install it from ollama.com, then: ollama pull qwen2.5:3b" }
-        docker @Compose build; docker @Compose run --rm -T audit; break
+        docker @Compose build; Check-Step "Building the tool"; docker @Compose run --rm -T audit; Check-Step "The self-check"; break
     }
-    "update" { git -C $Root pull --ff-only; Need-Docker; docker @Compose build; docker @Compose run --rm -T audit; break }
-    "build"  { Need-Docker; docker @Compose build; break }
+    "update" { git -C $Root pull --ff-only; Check-Step "Getting the new version (git pull)"; Need-Docker
+               docker @Compose build; Check-Step "Building the tool"; docker @Compose run --rm -T audit; Check-Step "The self-check"; break }
+    "build"  { Need-Docker; docker @Compose build; Check-Step "Building the tool"; break }
     "test"   { Need-Docker; docker @Compose run --rm -T audit; break }
+    "share"  { $d = Join-Path $Root "reports\share"; New-Item -ItemType Directory -Force $d | Out-Null; Invoke-Item $d; break }
     "open"   { New-Item -ItemType Directory -Force (Join-Path $Root "reports") | Out-Null; Invoke-Item (Join-Path $Root "reports"); break }
     "code" {
         $dir = (Get-Location).Path
